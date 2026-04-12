@@ -1,0 +1,135 @@
+"""
+eBay Hub UK - Database Module
+SQLite with WAL mode, thread-local connections.
+"""
+
+import sqlite3
+import threading
+import os
+
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'ebay_hub.db')
+
+_local = threading.local()
+
+
+def get_db():
+    """Get thread-local database connection."""
+    if not hasattr(_local, 'conn') or _local.conn is None:
+        _local.conn = sqlite3.connect(DB_PATH, timeout=30)
+        _local.conn.row_factory = sqlite3.Row
+        _local.conn.execute("PRAGMA journal_mode=WAL")
+        _local.conn.execute("PRAGMA synchronous=NORMAL")
+        _local.conn.execute("PRAGMA foreign_keys=ON")
+    return _local.conn
+
+
+def close_db():
+    """Close thread-local connection."""
+    if hasattr(_local, 'conn') and _local.conn is not None:
+        _local.conn.close()
+        _local.conn = None
+
+
+def init_db():
+    """Create all tables if they don't exist."""
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS pallets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            supplier TEXT DEFAULT '',
+            purchase_price_gbp REAL DEFAULT 0.0,
+            purchase_date TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            status TEXT DEFAULT 'active' CHECK(status IN ('active', 'sold', 'archived')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pallet_id INTEGER,
+            name TEXT NOT NULL,
+            asin TEXT DEFAULT '',
+            ean TEXT DEFAULT '',
+            quantity INTEGER DEFAULT 1,
+            condition TEXT DEFAULT 'new' CHECK(condition IN ('new', 'like_new', 'used', 'damaged')),
+            ebay_price_gbp REAL DEFAULT 0.0,
+            cost_per_unit REAL DEFAULT 0.0,
+            category TEXT DEFAULT '',
+            image_url TEXT DEFAULT '',
+            status TEXT DEFAULT 'warehouse' CHECK(status IN ('warehouse', 'listed', 'sold', 'shipped')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (pallet_id) REFERENCES pallets(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS ebay_listings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER,
+            ebay_item_id TEXT DEFAULT '',
+            title TEXT DEFAULT '',
+            description TEXT DEFAULT '',
+            price_gbp REAL DEFAULT 0.0,
+            status TEXT DEFAULT 'draft' CHECK(status IN ('draft', 'active', 'ended', 'sold')),
+            views INTEGER DEFAULT 0,
+            watchers INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (product_id) REFERENCES products(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ebay_order_id TEXT DEFAULT '',
+            product_id INTEGER,
+            listing_id INTEGER,
+            price_gbp REAL DEFAULT 0.0,
+            buyer TEXT DEFAULT '',
+            shipping_address TEXT DEFAULT '',
+            status TEXT DEFAULT 'new' CHECK(status IN ('new', 'shipped', 'delivered')),
+            sold_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            shipped_at TIMESTAMP,
+            FOREIGN KEY (product_id) REFERENCES products(id),
+            FOREIGN KEY (listing_id) REFERENCES ebay_listings(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS config (
+            key TEXT PRIMARY KEY,
+            value TEXT DEFAULT ''
+        );
+    """)
+    conn.commit()
+
+
+def get_config(key, default=''):
+    """Get a config value by key."""
+    conn = get_db()
+    row = conn.execute("SELECT value FROM config WHERE key = ?", (key,)).fetchone()
+    return row['value'] if row else default
+
+
+def set_config(key, value):
+    """Set a config value (upsert)."""
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
+        (key, str(value), str(value))
+    )
+    conn.commit()
+
+
+def query_db(query, args=(), one=False):
+    """Execute a query and return results as list of dicts."""
+    conn = get_db()
+    cur = conn.execute(query, args)
+    rows = cur.fetchall()
+    if one:
+        return dict(rows[0]) if rows else None
+    return [dict(r) for r in rows]
+
+
+def execute_db(query, args=()):
+    """Execute an insert/update/delete and return lastrowid."""
+    conn = get_db()
+    cur = conn.execute(query, args)
+    conn.commit()
+    return cur.lastrowid

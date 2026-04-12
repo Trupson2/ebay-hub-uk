@@ -1,0 +1,2306 @@
+"""
+eBay Hub UK v1.0.0
+Flask web application for eBay UK pallet reselling.
+Dark cyberpunk theme, mobile-first design.
+"""
+
+import os
+import csv
+import io
+import secrets
+from datetime import datetime, timedelta
+
+from flask import (
+    Flask, request, redirect, url_for, flash,
+    render_template_string, jsonify, g
+)
+
+from modules.database import (
+    get_db, close_db, init_db,
+    get_config, set_config,
+    query_db, execute_db
+)
+from modules.ebay_api import get_ebay_client
+
+# ---------------------------------------------------------------------------
+# Flask app setup
+# ---------------------------------------------------------------------------
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+
+# Initialise database on first request
+with app.app_context():
+    init_db()
+
+
+@app.teardown_appcontext
+def teardown_db(exception):
+    close_db()
+
+
+@app.before_request
+def before_request():
+    """Attach a CSP nonce to each request."""
+    request._csp_nonce = secrets.token_hex(16)
+
+
+@app.after_request
+def add_security_headers(response):
+    """Add Content-Security-Policy with nonce."""
+    nonce = getattr(request, '_csp_nonce', '')
+    csp = (
+        f"default-src 'self'; "
+        f"script-src 'nonce-{nonce}' 'self'; "
+        f"style-src 'nonce-{nonce}' 'self' https://fonts.googleapis.com; "
+        f"font-src 'self' https://fonts.gstatic.com; "
+        f"img-src 'self' https://images-na.ssl-images-amazon.com https://i.ebayimg.com data:; "
+        f"connect-src 'self'"
+    )
+    response.headers['Content-Security-Policy'] = csp
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Template helpers
+# ---------------------------------------------------------------------------
+
+def nonce():
+    return getattr(request, '_csp_nonce', '')
+
+
+def amazon_image(asin):
+    """Build Amazon product image URL from ASIN."""
+    if asin:
+        return f"https://images-na.ssl-images-amazon.com/images/I/{asin}._AC_SL1500_.jpg"
+    return ""
+
+
+def fmt_gbp(val):
+    """Format a number as GBP."""
+    try:
+        return f"\u00a3{float(val):,.2f}"
+    except (TypeError, ValueError):
+        return "\u00a30.00"
+
+
+def fmt_date(val):
+    """Format an ISO date string nicely."""
+    if not val:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+        return dt.strftime("%d %b %Y")
+    except Exception:
+        return str(val)[:10] if val else "-"
+
+
+def fmt_datetime(val):
+    """Format an ISO datetime string nicely."""
+    if not val:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(str(val).replace('Z', '+00:00'))
+        return dt.strftime("%d %b %Y %H:%M")
+    except Exception:
+        return str(val)[:16] if val else "-"
+
+
+def condition_label(cond):
+    """Human-friendly condition label."""
+    labels = {
+        'new': 'New',
+        'like_new': 'Like New',
+        'used': 'Used',
+        'damaged': 'Damaged'
+    }
+    return labels.get(cond, cond or 'Unknown')
+
+
+def status_color(status):
+    """CSS class for status badges."""
+    colors = {
+        'active': 'badge-cyan',
+        'warehouse': 'badge-purple',
+        'listed': 'badge-cyan',
+        'sold': 'badge-lime',
+        'shipped': 'badge-lime',
+        'delivered': 'badge-lime',
+        'draft': 'badge-muted',
+        'ended': 'badge-muted',
+        'archived': 'badge-muted',
+        'new': 'badge-pink',
+    }
+    return colors.get(status, 'badge-muted')
+
+
+# Register template context
+@app.context_processor
+def inject_helpers():
+    return dict(
+        nonce=nonce,
+        amazon_image=amazon_image,
+        fmt_gbp=fmt_gbp,
+        fmt_date=fmt_date,
+        fmt_datetime=fmt_datetime,
+        condition_label=condition_label,
+        status_color=status_color,
+        now=datetime.utcnow
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dashboard stats helpers
+# ---------------------------------------------------------------------------
+
+def get_dashboard_stats():
+    """Compute dashboard statistics."""
+    today = datetime.utcnow().strftime('%Y-%m-%d')
+    week_ago = (datetime.utcnow() - timedelta(days=7)).strftime('%Y-%m-%d')
+    month_ago = (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d')
+
+    # Sales totals
+    sales_today = query_db(
+        "SELECT COALESCE(SUM(price_gbp), 0) as total, COUNT(*) as cnt "
+        "FROM sales WHERE DATE(sold_at) = ?", (today,), one=True
+    )
+    sales_week = query_db(
+        "SELECT COALESCE(SUM(price_gbp), 0) as total, COUNT(*) as cnt "
+        "FROM sales WHERE DATE(sold_at) >= ?", (week_ago,), one=True
+    )
+    sales_month = query_db(
+        "SELECT COALESCE(SUM(price_gbp), 0) as total, COUNT(*) as cnt "
+        "FROM sales WHERE DATE(sold_at) >= ?", (month_ago,), one=True
+    )
+    sales_all = query_db(
+        "SELECT COALESCE(SUM(price_gbp), 0) as total, COUNT(*) as cnt FROM sales",
+        one=True
+    )
+
+    # Counts
+    active_listings = query_db(
+        "SELECT COUNT(*) as cnt FROM ebay_listings WHERE status = 'active'", one=True
+    )['cnt']
+    to_ship = query_db(
+        "SELECT COUNT(*) as cnt FROM sales WHERE status = 'new'", one=True
+    )['cnt']
+    total_products = query_db(
+        "SELECT COUNT(*) as cnt FROM products", one=True
+    )['cnt']
+    total_pallets = query_db(
+        "SELECT COUNT(*) as cnt FROM pallets", one=True
+    )['cnt']
+    warehouse_products = query_db(
+        "SELECT COUNT(*) as cnt FROM products WHERE status = 'warehouse'", one=True
+    )['cnt']
+
+    # Frozen capital: cost of pallets with unsold products
+    frozen = query_db(
+        "SELECT COALESCE(SUM(p.purchase_price_gbp), 0) as total "
+        "FROM pallets p WHERE p.status = 'active'",
+        one=True
+    )['total']
+
+    # Total cost for profit calculation
+    total_cost = query_db(
+        "SELECT COALESCE(SUM(purchase_price_gbp), 0) as total FROM pallets",
+        one=True
+    )['total']
+
+    total_revenue = sales_all['total']
+    total_profit = total_revenue - total_cost
+
+    # Monthly revenue data (last 6 months) for chart
+    chart_data = []
+    for i in range(5, -1, -1):
+        d = datetime.utcnow() - timedelta(days=30 * i)
+        month_start = d.replace(day=1).strftime('%Y-%m-%d')
+        if i > 0:
+            next_d = datetime.utcnow() - timedelta(days=30 * (i - 1))
+            month_end = next_d.replace(day=1).strftime('%Y-%m-%d')
+        else:
+            month_end = '2099-12-31'
+        row = query_db(
+            "SELECT COALESCE(SUM(price_gbp), 0) as rev FROM sales "
+            "WHERE DATE(sold_at) >= ? AND DATE(sold_at) < ?",
+            (month_start, month_end), one=True
+        )
+        chart_data.append({
+            'label': d.strftime('%b %Y'),
+            'revenue': round(row['rev'], 2)
+        })
+
+    return {
+        'sales_today': sales_today,
+        'sales_week': sales_week,
+        'sales_month': sales_month,
+        'sales_all': sales_all,
+        'active_listings': active_listings,
+        'to_ship': to_ship,
+        'total_products': total_products,
+        'total_pallets': total_pallets,
+        'warehouse_products': warehouse_products,
+        'frozen_capital': frozen,
+        'total_revenue': total_revenue,
+        'total_cost': total_cost,
+        'total_profit': total_profit,
+        'chart_data': chart_data,
+    }
+
+
+# ===================================================================
+# POST-only routes (no template rendering)
+# ===================================================================
+
+@app.route('/pallets/add', methods=['POST'])
+def pallet_add():
+    name = request.form.get('name', '').strip()
+    supplier = request.form.get('supplier', '').strip()
+    price = request.form.get('purchase_price_gbp', '0')
+    date = request.form.get('purchase_date', '')
+    notes = request.form.get('notes', '').strip()
+
+    if not name:
+        flash('Pallet name is required.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    try:
+        price = float(price)
+    except ValueError:
+        price = 0.0
+
+    execute_db(
+        "INSERT INTO pallets (name, supplier, purchase_price_gbp, purchase_date, notes) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (name, supplier, price, date, notes)
+    )
+    flash(f'Pallet "{name}" added successfully.', 'success')
+    return redirect(url_for('pallets_list'))
+
+
+@app.route('/pallet/<int:pallet_id>/delete', methods=['POST'])
+def pallet_delete(pallet_id):
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+    execute_db("DELETE FROM products WHERE pallet_id = ?", (pallet_id,))
+    execute_db("DELETE FROM pallets WHERE id = ?", (pallet_id,))
+    flash(f'Pallet "{pallet["name"]}" deleted.', 'success')
+    return redirect(url_for('pallets_list'))
+
+
+@app.route('/pallet/<int:pallet_id>/archive', methods=['POST'])
+def pallet_archive(pallet_id):
+    execute_db("UPDATE pallets SET status = 'archived' WHERE id = ?", (pallet_id,))
+    flash('Pallet archived.', 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
+@app.route('/pallet/<int:pallet_id>/add_product', methods=['POST'])
+def add_product(pallet_id):
+    name = request.form.get('name', '').strip()
+    asin = request.form.get('asin', '').strip()
+    ean = request.form.get('ean', '').strip()
+    quantity = request.form.get('quantity', '1')
+    condition = request.form.get('condition', 'new')
+    ebay_price = request.form.get('ebay_price_gbp', '0')
+    category = request.form.get('category', '').strip()
+
+    if not name:
+        flash('Product name is required.', 'error')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    try:
+        quantity = int(quantity)
+    except ValueError:
+        quantity = 1
+    try:
+        ebay_price = float(ebay_price)
+    except ValueError:
+        ebay_price = 0.0
+
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    product_count = query_db(
+        "SELECT COUNT(*) as cnt FROM products WHERE pallet_id = ?",
+        (pallet_id,), one=True
+    )['cnt']
+    cost_per_unit = (pallet['purchase_price_gbp'] or 0) / max(product_count + 1, 1)
+
+    image_url = amazon_image(asin)
+
+    execute_db(
+        "INSERT INTO products (pallet_id, name, asin, ean, quantity, condition, "
+        "ebay_price_gbp, cost_per_unit, category, image_url) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (pallet_id, name, asin, ean, quantity, condition,
+         ebay_price, cost_per_unit, category, image_url)
+    )
+    flash(f'Product "{name}" added.', 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
+@app.route('/product/<int:product_id>/update', methods=['POST'])
+def product_update(product_id):
+    name = request.form.get('name', '').strip()
+    asin = request.form.get('asin', '').strip()
+    ean = request.form.get('ean', '').strip()
+    quantity = request.form.get('quantity', '1')
+    condition = request.form.get('condition', 'new')
+    ebay_price = request.form.get('ebay_price_gbp', '0')
+    category = request.form.get('category', '').strip()
+    status = request.form.get('status', 'warehouse')
+
+    try:
+        quantity = int(quantity)
+    except ValueError:
+        quantity = 1
+    try:
+        ebay_price = float(ebay_price)
+    except ValueError:
+        ebay_price = 0.0
+
+    image_url = amazon_image(asin)
+
+    execute_db(
+        "UPDATE products SET name=?, asin=?, ean=?, quantity=?, condition=?, "
+        "ebay_price_gbp=?, category=?, image_url=?, status=? WHERE id=?",
+        (name, asin, ean, quantity, condition, ebay_price,
+         category, image_url, status, product_id)
+    )
+    flash('Product updated.', 'success')
+    return redirect(url_for('product_detail', product_id=product_id))
+
+
+@app.route('/product/<int:product_id>/delete', methods=['POST'])
+def product_delete(product_id):
+    product = query_db("SELECT * FROM products WHERE id = ?", (product_id,), one=True)
+    if not product:
+        flash('Product not found.', 'error')
+        return redirect(url_for('pallets_list'))
+    pallet_id = product['pallet_id']
+    execute_db("DELETE FROM ebay_listings WHERE product_id = ?", (product_id,))
+    execute_db("DELETE FROM sales WHERE product_id = ?", (product_id,))
+    execute_db("DELETE FROM products WHERE id = ?", (product_id,))
+    flash('Product deleted.', 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
+@app.route('/product/<int:product_id>/list_ebay', methods=['POST'])
+def list_on_ebay(product_id):
+    product = query_db("SELECT * FROM products WHERE id = ?", (product_id,), one=True)
+    if not product:
+        flash('Product not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    title = request.form.get('title', product['name'])
+    description = request.form.get('description', '')
+    price = request.form.get('price', str(product['ebay_price_gbp']))
+
+    try:
+        price = float(price)
+    except ValueError:
+        price = product['ebay_price_gbp']
+
+    listing_id = execute_db(
+        "INSERT INTO ebay_listings (product_id, title, description, price_gbp, status) "
+        "VALUES (?, ?, ?, ?, 'draft')",
+        (product_id, title, description, price)
+    )
+
+    ebay = get_ebay_client(get_config)
+    if ebay.is_configured():
+        result = ebay.create_listing({
+            'title': title,
+            'description': description,
+            'price': price,
+            'condition': product['condition'],
+            'quantity': product['quantity'],
+            'ean': product['ean'],
+            'image_urls': [product['image_url']] if product['image_url'] else []
+        })
+        if result and result.get('success'):
+            execute_db(
+                "UPDATE ebay_listings SET ebay_item_id=?, status='active' WHERE id=?",
+                (result['ebay_item_id'], listing_id)
+            )
+            execute_db(
+                "UPDATE products SET status='listed' WHERE id=?", (product_id,)
+            )
+            flash('Listed on eBay successfully!', 'success')
+        else:
+            error = result.get('error', 'Unknown error') if result else 'API error'
+            flash(f'Draft saved. eBay API: {error}', 'warning')
+    else:
+        flash('Draft listing saved. Configure eBay API in Settings to publish.', 'info')
+
+    return redirect(url_for('product_detail', product_id=product_id))
+
+
+@app.route('/order/<int:order_id>/ship', methods=['POST'])
+def order_mark_shipped(order_id):
+    execute_db(
+        "UPDATE sales SET status='shipped', shipped_at=CURRENT_TIMESTAMP WHERE id=?",
+        (order_id,)
+    )
+    order = query_db("SELECT * FROM sales WHERE id = ?", (order_id,), one=True)
+    if order and order['product_id']:
+        execute_db(
+            "UPDATE products SET status='shipped' WHERE id=?",
+            (order['product_id'],)
+        )
+    flash('Order marked as shipped.', 'success')
+    return redirect(url_for('orders_list'))
+
+
+@app.route('/api/add_sale', methods=['POST'])
+def api_add_sale():
+    product_id = request.form.get('product_id')
+    price = request.form.get('price_gbp', '0')
+    buyer = request.form.get('buyer', '')
+    address = request.form.get('shipping_address', '')
+
+    try:
+        price = float(price)
+    except ValueError:
+        price = 0.0
+
+    execute_db(
+        "INSERT INTO sales (product_id, price_gbp, buyer, shipping_address) "
+        "VALUES (?, ?, ?, ?)",
+        (product_id, price, buyer, address)
+    )
+
+    if product_id:
+        execute_db("UPDATE products SET status='sold' WHERE id=?", (product_id,))
+
+    flash('Sale recorded.', 'success')
+    return redirect(url_for('orders_list'))
+
+
+# ===================================================================
+# CSS THEME
+# ===================================================================
+
+CSS_THEME = """
+/* eBay Hub UK - Cyberpunk Theme */
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+
+:root {
+    --cyan: #8ff5ff;
+    --lime: #beee00;
+    --pink: #ff6b9b;
+    --purple: #a855f7;
+    --bg-dark: #0a0a0f;
+    --bg-card: #12121a;
+    --bg-card-hover: #1a1a26;
+    --bg-input: #1a1a26;
+    --border: #2a2a3a;
+    --text: #e0e0e8;
+    --text-muted: #6a6a80;
+    --danger: #ff4444;
+    --warning: #ffaa00;
+    --radius: 12px;
+    --radius-sm: 8px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+    font-family: 'Space Grotesk', sans-serif;
+    background: var(--bg-dark);
+    color: var(--text);
+    min-height: 100vh;
+    line-height: 1.5;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: var(--bg-dark); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--purple); }
+
+/* Layout */
+.app-container {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 16px 80px 16px;
+}
+
+/* Navigation */
+.navbar {
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 0;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: blur(10px);
+}
+.navbar-inner {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 0 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.navbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    font-weight: 700;
+    font-size: 1.2rem;
+    color: var(--cyan);
+}
+.navbar-brand .material-symbols-outlined { font-size: 28px; }
+.nav-links {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+}
+.nav-links a {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 12px;
+    color: var(--text-muted);
+    text-decoration: none;
+    border-radius: var(--radius-sm);
+    font-size: 0.85rem;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+.nav-links a:hover, .nav-links a.active {
+    color: var(--cyan);
+    background: rgba(143, 245, 255, 0.08);
+}
+.nav-links a .material-symbols-outlined { font-size: 20px; }
+
+/* Page header */
+.page-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 24px 0 20px 0;
+}
+.page-header h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--text);
+}
+.page-header h1 span { color: var(--cyan); }
+
+/* Cards */
+.card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+    transition: border-color 0.2s;
+}
+.card:hover { border-color: rgba(143, 245, 255, 0.2); }
+.card-title {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    margin-bottom: 8px;
+}
+.card-value {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: var(--cyan);
+}
+.card-value.lime { color: var(--lime); }
+.card-value.pink { color: var(--pink); }
+.card-value.purple { color: var(--purple); }
+.card-subtitle {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+/* Stats grid */
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+
+/* Tables */
+.table-wrap {
+    overflow-x: auto;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+th {
+    text-align: left;
+    padding: 12px 16px;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+td {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: var(--bg-card-hover); }
+.table-link {
+    color: var(--cyan);
+    text-decoration: none;
+    font-weight: 500;
+}
+.table-link:hover { text-decoration: underline; }
+
+/* Badges */
+.badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 10px;
+    border-radius: 20px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.badge-cyan { background: rgba(143, 245, 255, 0.12); color: var(--cyan); }
+.badge-lime { background: rgba(190, 238, 0, 0.12); color: var(--lime); }
+.badge-pink { background: rgba(255, 107, 155, 0.12); color: var(--pink); }
+.badge-purple { background: rgba(168, 85, 247, 0.12); color: var(--purple); }
+.badge-muted { background: rgba(106, 106, 128, 0.12); color: var(--text-muted); }
+.badge-danger { background: rgba(255, 68, 68, 0.12); color: var(--danger); }
+
+/* Buttons */
+.btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 20px;
+    border: none;
+    border-radius: var(--radius-sm);
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-decoration: none;
+    white-space: nowrap;
+}
+.btn .material-symbols-outlined { font-size: 20px; }
+.btn-cyan {
+    background: var(--cyan);
+    color: #0a0a0f;
+}
+.btn-cyan:hover { background: #adf8ff; box-shadow: 0 0 20px rgba(143, 245, 255, 0.3); }
+.btn-lime {
+    background: var(--lime);
+    color: #0a0a0f;
+}
+.btn-lime:hover { background: #d4ff2a; box-shadow: 0 0 20px rgba(190, 238, 0, 0.3); }
+.btn-pink {
+    background: var(--pink);
+    color: #0a0a0f;
+}
+.btn-pink:hover { background: #ff8db5; box-shadow: 0 0 20px rgba(255, 107, 155, 0.3); }
+.btn-purple {
+    background: var(--purple);
+    color: #fff;
+}
+.btn-purple:hover { background: #b86ef9; box-shadow: 0 0 20px rgba(168, 85, 247, 0.3); }
+.btn-outline {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+}
+.btn-outline:hover { border-color: var(--cyan); color: var(--cyan); }
+.btn-danger {
+    background: rgba(255, 68, 68, 0.15);
+    color: var(--danger);
+    border: 1px solid rgba(255, 68, 68, 0.3);
+}
+.btn-danger:hover { background: rgba(255, 68, 68, 0.25); }
+.btn-sm { padding: 6px 14px; font-size: 0.8rem; }
+.btn-block { width: 100%; justify-content: center; }
+
+/* Filter tabs */
+.filter-tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+.filter-tab {
+    padding: 8px 16px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.85rem;
+    font-weight: 500;
+    transition: all 0.2s;
+}
+.filter-tab:hover { border-color: var(--cyan); color: var(--cyan); }
+.filter-tab.active {
+    background: rgba(143, 245, 255, 0.1);
+    border-color: var(--cyan);
+    color: var(--cyan);
+}
+.filter-count {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 6px;
+    border-radius: 10px;
+    background: rgba(143, 245, 255, 0.15);
+    font-size: 0.7rem;
+    margin-left: 6px;
+}
+
+/* Forms */
+.form-group {
+    margin-bottom: 16px;
+}
+.form-label {
+    display: block;
+    margin-bottom: 6px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+.form-control {
+    width: 100%;
+    padding: 10px 14px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 0.9rem;
+    transition: border-color 0.2s;
+}
+.form-control:focus {
+    outline: none;
+    border-color: var(--cyan);
+    box-shadow: 0 0 0 3px rgba(143, 245, 255, 0.1);
+}
+select.form-control {
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg width='12' height='8' viewBox='0 0 12 8' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%236a6a80' stroke-width='2' fill='none'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 14px center;
+    padding-right: 36px;
+}
+textarea.form-control { resize: vertical; min-height: 80px; }
+.form-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+}
+.form-hint {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+/* Modal */
+.modal-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+    z-index: 200;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+}
+.modal-overlay.active { display: flex; }
+.modal {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    width: 100%;
+    max-width: 520px;
+    max-height: 90vh;
+    overflow-y: auto;
+}
+.modal-title {
+    font-size: 1.2rem;
+    font-weight: 700;
+    margin-bottom: 20px;
+    color: var(--cyan);
+}
+
+/* Flash messages */
+.flash-container { margin: 16px 0; }
+.flash {
+    padding: 12px 16px;
+    border-radius: var(--radius-sm);
+    margin-bottom: 8px;
+    font-size: 0.9rem;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.flash-success { background: rgba(190, 238, 0, 0.1); border: 1px solid rgba(190, 238, 0, 0.3); color: var(--lime); }
+.flash-error { background: rgba(255, 68, 68, 0.1); border: 1px solid rgba(255, 68, 68, 0.3); color: var(--danger); }
+.flash-warning { background: rgba(255, 170, 0, 0.1); border: 1px solid rgba(255, 170, 0, 0.3); color: var(--warning); }
+.flash-info { background: rgba(143, 245, 255, 0.1); border: 1px solid rgba(143, 245, 255, 0.3); color: var(--cyan); }
+
+/* Product grid */
+.product-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 16px;
+    margin-bottom: 24px;
+}
+.product-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    transition: all 0.2s;
+    text-decoration: none;
+    color: var(--text);
+    display: block;
+}
+.product-card:hover {
+    border-color: var(--cyan);
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+.product-card-img {
+    width: 100%;
+    height: 160px;
+    object-fit: contain;
+    background: #1a1a26;
+    padding: 12px;
+}
+.product-card-body { padding: 14px; }
+.product-card-name {
+    font-weight: 600;
+    font-size: 0.9rem;
+    margin-bottom: 6px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.product-card-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 8px;
+}
+.product-card-price {
+    font-weight: 700;
+    color: var(--lime);
+    font-size: 1.1rem;
+}
+
+/* Chart bar */
+.chart-container { margin-bottom: 24px; }
+.chart-bars {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    height: 160px;
+    padding: 0 4px;
+}
+.chart-bar-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    height: 100%;
+    justify-content: flex-end;
+}
+.chart-bar {
+    width: 100%;
+    max-width: 60px;
+    background: linear-gradient(to top, var(--cyan), var(--purple));
+    border-radius: 4px 4px 0 0;
+    min-height: 2px;
+    transition: height 0.3s;
+}
+.chart-bar-label {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    margin-top: 6px;
+    text-align: center;
+}
+.chart-bar-value {
+    font-size: 0.7rem;
+    color: var(--cyan);
+    margin-bottom: 4px;
+    font-weight: 600;
+}
+
+/* Detail page layout */
+.detail-header {
+    display: flex;
+    gap: 24px;
+    margin-bottom: 24px;
+    flex-wrap: wrap;
+}
+.detail-image {
+    width: 200px;
+    height: 200px;
+    object-fit: contain;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px;
+    flex-shrink: 0;
+}
+.detail-info { flex: 1; min-width: 250px; }
+.detail-info h2 {
+    font-size: 1.3rem;
+    margin-bottom: 12px;
+}
+.detail-meta {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px 16px;
+    font-size: 0.9rem;
+}
+.detail-meta dt { color: var(--text-muted); }
+.detail-meta dd { color: var(--text); }
+
+/* Section headings */
+.section-title {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin: 24px 0 16px 0;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--cyan);
+}
+
+/* Empty state */
+.empty-state {
+    text-align: center;
+    padding: 48px 20px;
+    color: var(--text-muted);
+}
+.empty-state .material-symbols-outlined {
+    font-size: 48px;
+    margin-bottom: 12px;
+    opacity: 0.3;
+}
+.empty-state p { font-size: 1rem; margin-bottom: 16px; }
+
+/* Utility */
+.text-cyan { color: var(--cyan); }
+.text-lime { color: var(--lime); }
+.text-pink { color: var(--pink); }
+.text-purple { color: var(--purple); }
+.text-muted { color: var(--text-muted); }
+.text-danger { color: var(--danger); }
+.text-right { text-align: right; }
+.mt-16 { margin-top: 16px; }
+.mb-16 { margin-bottom: 16px; }
+.flex-between {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+.gap-8 { gap: 8px; }
+.d-flex { display: flex; }
+.align-center { align-items: center; }
+.inline-form { display: inline; }
+
+/* Responsive */
+@media (max-width: 768px) {
+    .navbar-inner { flex-direction: column; align-items: flex-start; }
+    .nav-links { width: 100%; overflow-x: auto; }
+    .page-header { flex-direction: column; align-items: flex-start; }
+    .page-header h1 { font-size: 1.2rem; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+    .card-value { font-size: 1.4rem; }
+    .detail-header { flex-direction: column; }
+    .detail-image { width: 100%; height: 200px; }
+    .form-row { grid-template-columns: 1fr; }
+    .product-grid { grid-template-columns: 1fr; }
+    .modal { padding: 16px; }
+}
+
+@media (max-width: 480px) {
+    .stats-grid { grid-template-columns: 1fr; }
+    .nav-links a span.nav-text { display: none; }
+}
+"""
+
+# ===================================================================
+# TEMPLATES
+# ===================================================================
+
+# -------------------------------------------------------------------
+# Base template (layout wrapper)
+# -------------------------------------------------------------------
+TEMPLATE_BASE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ page_title | default('eBay Hub UK') }}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link nonce="{{ nonce() }}" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link nonce="{{ nonce() }}" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=swap" rel="stylesheet">
+    <style nonce="{{ nonce() }}">""" + CSS_THEME + """</style>
+</head>
+<body>
+
+<nav class="navbar">
+    <div class="navbar-inner">
+        <a href="/" class="navbar-brand">
+            <span class="material-symbols-outlined">hub</span>
+            eBay Hub UK
+        </a>
+        <div class="nav-links">
+            <a href="/" class="{{ 'active' if active_page == 'dashboard' else '' }}">
+                <span class="material-symbols-outlined">dashboard</span>
+                <span class="nav-text">Dashboard</span>
+            </a>
+            <a href="/pallets" class="{{ 'active' if active_page == 'pallets' else '' }}">
+                <span class="material-symbols-outlined">inventory_2</span>
+                <span class="nav-text">Pallets</span>
+            </a>
+            <a href="/listings" class="{{ 'active' if active_page == 'listings' else '' }}">
+                <span class="material-symbols-outlined">sell</span>
+                <span class="nav-text">Listings</span>
+            </a>
+            <a href="/orders" class="{{ 'active' if active_page == 'orders' else '' }}">
+                <span class="material-symbols-outlined">local_shipping</span>
+                <span class="nav-text">Orders</span>
+            </a>
+            <a href="/settings" class="{{ 'active' if active_page == 'settings' else '' }}">
+                <span class="material-symbols-outlined">settings</span>
+                <span class="nav-text">Settings</span>
+            </a>
+        </div>
+    </div>
+</nav>
+
+<div class="app-container">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    <div class="flash-container">
+        {% for category, message in messages %}
+        <div class="flash flash-{{ category }}">
+            <span class="material-symbols-outlined">
+                {% if category == 'success' %}check_circle{% elif category == 'error' %}error{% elif category == 'warning' %}warning{% else %}info{% endif %}
+            </span>
+            {{ message }}
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+    {% endwith %}
+
+    {{ content }}
+</div>
+
+</body>
+</html>"""
+
+# -------------------------------------------------------------------
+# Helper: wrap content in base
+# -------------------------------------------------------------------
+def render_page(content_template, page_title='eBay Hub UK', active_page='', **kwargs):
+    """Render a content template inside the base layout."""
+    from markupsafe import Markup
+    content_html = render_template_string(content_template, **kwargs)
+    return render_template_string(
+        TEMPLATE_BASE,
+        content=Markup(content_html),
+        page_title=page_title,
+        active_page=active_page,
+        **kwargs
+    )
+
+
+# -------------------------------------------------------------------
+# Dashboard Template
+# -------------------------------------------------------------------
+TEMPLATE_DASHBOARD_CONTENT = """
+<div class="page-header">
+    <h1><span>Dashboard</span></h1>
+</div>
+
+<div class="stats-grid">
+    <div class="card">
+        <div class="card-title">Today's Sales</div>
+        <div class="card-value">{{ fmt_gbp(stats.sales_today.total) }}</div>
+        <div class="card-subtitle">{{ stats.sales_today.cnt }} order{{ 's' if stats.sales_today.cnt != 1 }}</div>
+    </div>
+    <div class="card">
+        <div class="card-title">This Week</div>
+        <div class="card-value lime">{{ fmt_gbp(stats.sales_week.total) }}</div>
+        <div class="card-subtitle">{{ stats.sales_week.cnt }} order{{ 's' if stats.sales_week.cnt != 1 }}</div>
+    </div>
+    <div class="card">
+        <div class="card-title">This Month</div>
+        <div class="card-value purple">{{ fmt_gbp(stats.sales_month.total) }}</div>
+        <div class="card-subtitle">{{ stats.sales_month.cnt }} order{{ 's' if stats.sales_month.cnt != 1 }}</div>
+    </div>
+    <div class="card">
+        <div class="card-title">Total Profit</div>
+        <div class="card-value {{ 'lime' if stats.total_profit >= 0 else 'text-danger' }}">
+            {{ fmt_gbp(stats.total_profit) }}
+        </div>
+        <div class="card-subtitle">Revenue: {{ fmt_gbp(stats.total_revenue) }}</div>
+    </div>
+</div>
+
+<div class="stats-grid">
+    <div class="card">
+        <div class="card-title">Active Listings</div>
+        <div class="card-value cyan">{{ stats.active_listings }}</div>
+    </div>
+    <div class="card">
+        <div class="card-title">To Ship</div>
+        <div class="card-value pink">{{ stats.to_ship }}</div>
+        {% if stats.to_ship > 0 %}
+        <a href="/orders?status=new" class="btn btn-pink btn-sm mt-16">
+            <span class="material-symbols-outlined">local_shipping</span> View Orders
+        </a>
+        {% endif %}
+    </div>
+    <div class="card">
+        <div class="card-title">Products</div>
+        <div class="card-value purple">{{ stats.total_products }}</div>
+        <div class="card-subtitle">{{ stats.warehouse_products }} in warehouse</div>
+    </div>
+    <div class="card">
+        <div class="card-title">Frozen Capital</div>
+        <div class="card-value">{{ fmt_gbp(stats.frozen_capital) }}</div>
+        <div class="card-subtitle">{{ stats.total_pallets }} pallet{{ 's' if stats.total_pallets != 1 }}</div>
+    </div>
+</div>
+
+<!-- Revenue Chart -->
+<div class="card chart-container">
+    <div class="card-title">Monthly Revenue</div>
+    {% set max_rev = stats.chart_data | map(attribute='revenue') | max %}
+    <div class="chart-bars">
+        {% for bar in stats.chart_data %}
+        <div class="chart-bar-wrap">
+            <div class="chart-bar-value">{{ fmt_gbp(bar.revenue) }}</div>
+            <div class="chart-bar" style="height: {{ (bar.revenue / max_rev * 120) if max_rev > 0 else 2 }}px"></div>
+            <div class="chart-bar-label">{{ bar.label }}</div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Quick Actions -->
+<div class="card">
+    <div class="card-title">Quick Actions</div>
+    <div class="d-flex gap-8" style="flex-wrap: wrap; margin-top: 12px;">
+        <a href="/pallets" class="btn btn-cyan">
+            <span class="material-symbols-outlined">add</span> New Pallet
+        </a>
+        <a href="/listings" class="btn btn-purple">
+            <span class="material-symbols-outlined">sell</span> View Listings
+        </a>
+        <a href="/orders?status=new" class="btn btn-pink">
+            <span class="material-symbols-outlined">local_shipping</span> Pending Orders
+        </a>
+        <a href="/settings" class="btn btn-outline">
+            <span class="material-symbols-outlined">settings</span> Settings
+        </a>
+    </div>
+</div>
+"""
+
+# -------------------------------------------------------------------
+# Route: Dashboard
+# -------------------------------------------------------------------
+@app.route('/')
+def dashboard():
+    stats = get_dashboard_stats()
+    return render_page(
+        TEMPLATE_DASHBOARD_CONTENT,
+        page_title='Dashboard - eBay Hub UK',
+        active_page='dashboard',
+        stats=stats
+    )
+
+
+# -------------------------------------------------------------------
+# Pallets Template
+# -------------------------------------------------------------------
+TEMPLATE_PALLETS_CONTENT = """
+<div class="page-header">
+    <h1><span>Pallets</span></h1>
+    <button class="btn btn-cyan" onclick="document.getElementById('addPalletModal').classList.add('active')">
+        <span class="material-symbols-outlined">add</span> Add Pallet
+    </button>
+</div>
+
+{% if pallets %}
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Supplier</th>
+                <th>Cost</th>
+                <th>Products</th>
+                <th>Sold</th>
+                <th>Revenue</th>
+                <th>ROI</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for p in pallets %}
+            <tr>
+                <td>
+                    <a href="/pallet/{{ p.id }}" class="table-link">{{ p.name }}</a>
+                </td>
+                <td class="text-muted">{{ p.supplier or '-' }}</td>
+                <td>{{ fmt_gbp(p.purchase_price_gbp) }}</td>
+                <td>{{ p.product_count }}</td>
+                <td>{{ p.sold_count }}</td>
+                <td class="text-lime">{{ fmt_gbp(p.revenue) }}</td>
+                <td>
+                    {% if p.purchase_price_gbp > 0 %}
+                        {% set roi = ((p.revenue - p.purchase_price_gbp) / p.purchase_price_gbp * 100) %}
+                        <span class="{{ 'text-lime' if roi >= 0 else 'text-danger' }}">
+                            {{ "%.0f"|format(roi) }}%
+                        </span>
+                    {% else %}-{% endif %}
+                </td>
+                <td><span class="badge {{ status_color(p.status) }}">{{ p.status }}</span></td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="empty-state">
+    <span class="material-symbols-outlined">inventory_2</span>
+    <p>No pallets yet. Add your first pallet to get started!</p>
+    <button class="btn btn-cyan" onclick="document.getElementById('addPalletModal').classList.add('active')">
+        <span class="material-symbols-outlined">add</span> Add Pallet
+    </button>
+</div>
+{% endif %}
+
+<!-- Add Pallet Modal -->
+<div id="addPalletModal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('active')">
+    <div class="modal">
+        <div class="modal-title">Add New Pallet</div>
+        <form method="POST" action="/pallets/add">
+            <div class="form-group">
+                <label class="form-label">Pallet Name *</label>
+                <input type="text" name="name" class="form-control" placeholder="e.g. Amazon Returns Batch #12" required>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Supplier</label>
+                    <input type="text" name="supplier" class="form-control" placeholder="e.g. Wholesale Co">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Purchase Price (GBP)</label>
+                    <input type="number" step="0.01" name="purchase_price_gbp" class="form-control" placeholder="0.00">
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Purchase Date</label>
+                <input type="date" name="purchase_date" class="form-control">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Notes</label>
+                <textarea name="notes" class="form-control" rows="3" placeholder="Optional notes..."></textarea>
+            </div>
+            <div class="d-flex gap-8" style="justify-content: flex-end; margin-top: 20px;">
+                <button type="button" class="btn btn-outline" onclick="document.getElementById('addPalletModal').classList.remove('active')">Cancel</button>
+                <button type="submit" class="btn btn-cyan">
+                    <span class="material-symbols-outlined">add</span> Add Pallet
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+"""
+
+@app.route('/pallets')
+def pallets_list():
+    pallets = query_db("""
+        SELECT p.*,
+            COUNT(pr.id) as product_count,
+            SUM(CASE WHEN pr.status = 'sold' THEN 1 ELSE 0 END) as sold_count,
+            COALESCE(SUM(CASE WHEN pr.status = 'sold' THEN pr.ebay_price_gbp ELSE 0 END), 0) as revenue
+        FROM pallets p
+        LEFT JOIN products pr ON pr.pallet_id = p.id
+        GROUP BY p.id
+        ORDER BY p.created_at DESC
+    """)
+    return render_page(
+        TEMPLATE_PALLETS_CONTENT,
+        page_title='Pallets - eBay Hub UK',
+        active_page='pallets',
+        pallets=pallets
+    )
+
+
+# -------------------------------------------------------------------
+# Pallet Detail Template
+# -------------------------------------------------------------------
+TEMPLATE_PALLET_DETAIL_CONTENT = """
+<div class="page-header">
+    <h1>
+        <a href="/pallets" class="text-muted" style="text-decoration: none;">Pallets</a>
+        <span class="text-muted">/</span>
+        <span>{{ pallet.name }}</span>
+    </h1>
+    <div class="d-flex gap-8">
+        <a href="/pallet/{{ pallet.id }}/import" class="btn btn-purple btn-sm">
+            <span class="material-symbols-outlined">upload_file</span> Import CSV
+        </a>
+        <form method="POST" action="/pallet/{{ pallet.id }}/archive" class="inline-form">
+            <button type="submit" class="btn btn-outline btn-sm">
+                <span class="material-symbols-outlined">archive</span> Archive
+            </button>
+        </form>
+    </div>
+</div>
+
+<!-- Pallet Stats -->
+<div class="stats-grid">
+    <div class="card">
+        <div class="card-title">Pallet Cost</div>
+        <div class="card-value">{{ fmt_gbp(pallet.purchase_price_gbp) }}</div>
+        <div class="card-subtitle">{{ pallet.supplier or 'No supplier' }} &middot; {{ fmt_date(pallet.purchase_date) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-title">Products</div>
+        <div class="card-value purple">{{ stats.total }}</div>
+        <div class="card-subtitle">{{ stats.warehouse }} warehouse / {{ stats.listed }} listed / {{ stats.sold }} sold</div>
+    </div>
+    <div class="card">
+        <div class="card-title">Revenue</div>
+        <div class="card-value lime">{{ fmt_gbp(stats.revenue) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-title">Profit</div>
+        <div class="card-value {{ 'lime' if profit >= 0 else 'text-danger' }}">{{ fmt_gbp(profit) }}</div>
+        {% if pallet.purchase_price_gbp > 0 %}
+        <div class="card-subtitle">ROI: {{ "%.0f"|format((profit / pallet.purchase_price_gbp) * 100) }}%</div>
+        {% endif %}
+    </div>
+</div>
+
+{% if pallet.notes %}
+<div class="card mb-16">
+    <div class="card-title">Notes</div>
+    <p>{{ pallet.notes }}</p>
+</div>
+{% endif %}
+
+<!-- Add Product -->
+<div class="flex-between mb-16">
+    <h3 class="section-title" style="margin: 0; border: none; padding: 0;">Products</h3>
+    <button class="btn btn-cyan btn-sm" onclick="document.getElementById('addProductModal').classList.add('active')">
+        <span class="material-symbols-outlined">add</span> Add Product
+    </button>
+</div>
+
+{% if products %}
+<div class="product-grid">
+    {% for p in products %}
+    <a href="/product/{{ p.id }}" class="product-card">
+        {% if p.image_url %}
+        <img src="{{ p.image_url }}" alt="{{ p.name }}" class="product-card-img"
+             onerror="this.style.display='none'">
+        {% else %}
+        <div class="product-card-img" style="display:flex;align-items:center;justify-content:center;">
+            <span class="material-symbols-outlined" style="font-size:48px;opacity:0.2;">image</span>
+        </div>
+        {% endif %}
+        <div class="product-card-body">
+            <div class="product-card-name">{{ p.name }}</div>
+            <div style="font-size:0.75rem;color:var(--text-muted);">
+                {% if p.asin %}ASIN: {{ p.asin }}{% endif %}
+                {% if p.ean %} &middot; EAN: {{ p.ean }}{% endif %}
+            </div>
+            <div class="product-card-meta">
+                <div class="product-card-price">{{ fmt_gbp(p.ebay_price_gbp) }}</div>
+                <span class="badge {{ status_color(p.status) }}">{{ p.status }}</span>
+            </div>
+            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:4px;">
+                Qty: {{ p.quantity }} &middot; {{ condition_label(p.condition) }}
+            </div>
+        </div>
+    </a>
+    {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+    <span class="material-symbols-outlined">category</span>
+    <p>No products in this pallet yet.</p>
+    <div class="d-flex gap-8" style="justify-content: center;">
+        <button class="btn btn-cyan" onclick="document.getElementById('addProductModal').classList.add('active')">
+            <span class="material-symbols-outlined">add</span> Add Product
+        </button>
+        <a href="/pallet/{{ pallet.id }}/import" class="btn btn-purple">
+            <span class="material-symbols-outlined">upload_file</span> Import CSV
+        </a>
+    </div>
+</div>
+{% endif %}
+
+<!-- Add Product Modal -->
+<div id="addProductModal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('active')">
+    <div class="modal">
+        <div class="modal-title">Add Product</div>
+        <form method="POST" action="/pallet/{{ pallet.id }}/add_product">
+            <div class="form-group">
+                <label class="form-label">Product Name *</label>
+                <input type="text" name="name" class="form-control" placeholder="e.g. Sony WH-1000XM5" required>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">ASIN</label>
+                    <input type="text" name="asin" class="form-control" placeholder="B0BS1N8GK7">
+                    <div class="form-hint">Amazon product ID (for image)</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">EAN / Barcode</label>
+                    <input type="text" name="ean" class="form-control" placeholder="5027242923485">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Quantity</label>
+                    <input type="number" name="quantity" class="form-control" value="1" min="1">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Condition</label>
+                    <select name="condition" class="form-control">
+                        <option value="new">New</option>
+                        <option value="like_new">Like New</option>
+                        <option value="used">Used</option>
+                        <option value="damaged">Damaged</option>
+                    </select>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">eBay Price (GBP)</label>
+                    <input type="number" step="0.01" name="ebay_price_gbp" class="form-control" placeholder="0.00">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Category</label>
+                    <input type="text" name="category" class="form-control" placeholder="e.g. Electronics">
+                </div>
+            </div>
+            <div class="d-flex gap-8" style="justify-content: flex-end; margin-top: 20px;">
+                <button type="button" class="btn btn-outline" onclick="document.getElementById('addProductModal').classList.remove('active')">Cancel</button>
+                <button type="submit" class="btn btn-cyan">
+                    <span class="material-symbols-outlined">add</span> Add Product
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+"""
+
+@app.route('/pallet/<int:pallet_id>')
+def pallet_detail(pallet_id):
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    products = query_db(
+        "SELECT * FROM products WHERE pallet_id = ? ORDER BY created_at DESC",
+        (pallet_id,)
+    )
+
+    stats = query_db("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'listed' THEN 1 ELSE 0 END) as listed,
+            SUM(CASE WHEN status = 'sold' THEN 1 ELSE 0 END) as sold,
+            SUM(CASE WHEN status = 'warehouse' THEN 1 ELSE 0 END) as warehouse,
+            COALESCE(SUM(CASE WHEN status = 'sold' THEN ebay_price_gbp ELSE 0 END), 0) as revenue,
+            COALESCE(SUM(ebay_price_gbp * quantity), 0) as potential_revenue
+        FROM products WHERE pallet_id = ?
+    """, (pallet_id,), one=True)
+
+    profit = (stats['revenue'] or 0) - (pallet['purchase_price_gbp'] or 0)
+
+    return render_page(
+        TEMPLATE_PALLET_DETAIL_CONTENT,
+        page_title=f'{pallet["name"]} - eBay Hub UK',
+        active_page='pallets',
+        pallet=pallet, products=products, stats=stats, profit=profit
+    )
+
+
+# -------------------------------------------------------------------
+# CSV Import Template
+# -------------------------------------------------------------------
+TEMPLATE_CSV_IMPORT_CONTENT = """
+<div class="page-header">
+    <h1>
+        <a href="/pallets" class="text-muted" style="text-decoration: none;">Pallets</a>
+        <span class="text-muted">/</span>
+        <a href="/pallet/{{ pallet.id }}" class="text-muted" style="text-decoration: none;">{{ pallet.name }}</a>
+        <span class="text-muted">/</span>
+        <span>Import CSV</span>
+    </h1>
+</div>
+
+<div class="card">
+    <div class="card-title">Upload CSV File</div>
+    <p style="margin: 12px 0; color: var(--text-muted); font-size: 0.9rem;">
+        Upload a CSV file with product data. The file should have headers matching these columns:
+    </p>
+
+    <div class="table-wrap mb-16">
+        <table>
+            <thead>
+                <tr>
+                    <th>Column</th>
+                    <th>Required</th>
+                    <th>Description</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>name <span class="text-muted">or</span> title</td><td><span class="text-lime">Yes</span></td><td>Product name</td></tr>
+                <tr><td>asin</td><td><span class="text-muted">No</span></td><td>Amazon ASIN (for image)</td></tr>
+                <tr><td>ean</td><td><span class="text-muted">No</span></td><td>EAN / Barcode</td></tr>
+                <tr><td>quantity</td><td><span class="text-muted">No</span></td><td>Quantity (default: 1)</td></tr>
+                <tr><td>condition</td><td><span class="text-muted">No</span></td><td>new / like_new / used / damaged</td></tr>
+                <tr><td>price <span class="text-muted">or</span> ebay_price</td><td><span class="text-muted">No</span></td><td>eBay listing price in GBP</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <form method="POST" enctype="multipart/form-data" action="/pallet/{{ pallet.id }}/import">
+        <div class="form-group">
+            <label class="form-label">Select CSV File</label>
+            <input type="file" name="csv_file" accept=".csv" class="form-control" required>
+        </div>
+        <div class="d-flex gap-8" style="margin-top: 20px;">
+            <a href="/pallet/{{ pallet.id }}" class="btn btn-outline">Cancel</a>
+            <button type="submit" class="btn btn-purple">
+                <span class="material-symbols-outlined">upload_file</span> Import Products
+            </button>
+        </div>
+    </form>
+</div>
+"""
+
+@app.route('/pallet/<int:pallet_id>/import', methods=['GET', 'POST'])
+def csv_import(pallet_id):
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    if request.method == 'POST':
+        file = request.files.get('csv_file')
+        if not file or not file.filename.endswith('.csv'):
+            flash('Please upload a valid CSV file.', 'error')
+            return redirect(url_for('csv_import', pallet_id=pallet_id))
+
+        try:
+            stream = io.StringIO(file.stream.read().decode('utf-8-sig'))
+            reader = csv.DictReader(stream)
+            count = 0
+            for row in reader:
+                name = row.get('name', row.get('title', '')).strip()
+                if not name:
+                    continue
+                asin = row.get('asin', '').strip()
+                ean = row.get('ean', '').strip()
+                try:
+                    qty = int(row.get('quantity', '1').strip())
+                except ValueError:
+                    qty = 1
+                cond = row.get('condition', 'new').strip().lower()
+                if cond not in ('new', 'like_new', 'used', 'damaged'):
+                    cond = 'new'
+                try:
+                    price = float(row.get('price', row.get('ebay_price', '0')).strip())
+                except ValueError:
+                    price = 0.0
+
+                execute_db(
+                    "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
+                    "condition, ebay_price_gbp, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (pallet_id, name, asin, ean, qty, cond, price, amazon_image(asin))
+                )
+                count += 1
+
+            flash(f'Imported {count} products from CSV.', 'success')
+            return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+        except Exception as e:
+            flash(f'Error reading CSV: {e}', 'error')
+            return redirect(url_for('csv_import', pallet_id=pallet_id))
+
+    return render_page(
+        TEMPLATE_CSV_IMPORT_CONTENT,
+        page_title=f'Import CSV - {pallet["name"]} - eBay Hub UK',
+        active_page='pallets',
+        pallet=pallet
+    )
+
+
+# -------------------------------------------------------------------
+# Product Detail Template
+# -------------------------------------------------------------------
+TEMPLATE_PRODUCT_DETAIL_CONTENT = """
+<div class="page-header">
+    <h1>
+        <a href="/pallets" class="text-muted" style="text-decoration: none;">Pallets</a>
+        <span class="text-muted">/</span>
+        {% if pallet %}
+        <a href="/pallet/{{ pallet.id }}" class="text-muted" style="text-decoration: none;">{{ pallet.name }}</a>
+        <span class="text-muted">/</span>
+        {% endif %}
+        <span>{{ product.name[:40] }}{% if product.name|length > 40 %}...{% endif %}</span>
+    </h1>
+</div>
+
+<div class="detail-header">
+    {% if product.image_url %}
+    <img src="{{ product.image_url }}" alt="{{ product.name }}" class="detail-image"
+         onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><rect fill=%22%2312121a%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%236a6a80%22 font-size=%2214%22>No Image</text></svg>'">
+    {% endif %}
+    <div class="detail-info">
+        <h2>{{ product.name }}</h2>
+        <dl class="detail-meta">
+            <dt>ASIN</dt><dd>{{ product.asin or '-' }}</dd>
+            <dt>EAN</dt><dd>{{ product.ean or '-' }}</dd>
+            <dt>Condition</dt><dd>{{ condition_label(product.condition) }}</dd>
+            <dt>Quantity</dt><dd>{{ product.quantity }}</dd>
+            <dt>eBay Price</dt><dd class="text-lime">{{ fmt_gbp(product.ebay_price_gbp) }}</dd>
+            <dt>Status</dt><dd><span class="badge {{ status_color(product.status) }}">{{ product.status }}</span></dd>
+            <dt>Category</dt><dd>{{ product.category or '-' }}</dd>
+            <dt>Added</dt><dd>{{ fmt_datetime(product.created_at) }}</dd>
+        </dl>
+    </div>
+</div>
+
+<!-- Edit Product -->
+<div class="section-title">Edit Product</div>
+<div class="card">
+    <form method="POST" action="/product/{{ product.id }}/update">
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">Name</label>
+                <input type="text" name="name" class="form-control" value="{{ product.name }}" required>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Status</label>
+                <select name="status" class="form-control">
+                    <option value="warehouse" {{ 'selected' if product.status == 'warehouse' }}>Warehouse</option>
+                    <option value="listed" {{ 'selected' if product.status == 'listed' }}>Listed</option>
+                    <option value="sold" {{ 'selected' if product.status == 'sold' }}>Sold</option>
+                    <option value="shipped" {{ 'selected' if product.status == 'shipped' }}>Shipped</option>
+                </select>
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">ASIN</label>
+                <input type="text" name="asin" class="form-control" value="{{ product.asin }}">
+            </div>
+            <div class="form-group">
+                <label class="form-label">EAN</label>
+                <input type="text" name="ean" class="form-control" value="{{ product.ean }}">
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">Quantity</label>
+                <input type="number" name="quantity" class="form-control" value="{{ product.quantity }}" min="1">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Condition</label>
+                <select name="condition" class="form-control">
+                    <option value="new" {{ 'selected' if product.condition == 'new' }}>New</option>
+                    <option value="like_new" {{ 'selected' if product.condition == 'like_new' }}>Like New</option>
+                    <option value="used" {{ 'selected' if product.condition == 'used' }}>Used</option>
+                    <option value="damaged" {{ 'selected' if product.condition == 'damaged' }}>Damaged</option>
+                </select>
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">eBay Price (GBP)</label>
+                <input type="number" step="0.01" name="ebay_price_gbp" class="form-control" value="{{ product.ebay_price_gbp }}">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Category</label>
+                <input type="text" name="category" class="form-control" value="{{ product.category }}">
+            </div>
+        </div>
+        <div class="d-flex gap-8" style="margin-top: 16px;">
+            <button type="submit" class="btn btn-cyan">
+                <span class="material-symbols-outlined">save</span> Save Changes
+            </button>
+        </div>
+    </form>
+</div>
+
+<!-- List on eBay -->
+<div class="section-title">eBay Listing</div>
+<div class="card">
+    <form method="POST" action="/product/{{ product.id }}/list_ebay">
+        <div class="form-group">
+            <label class="form-label">Listing Title</label>
+            <input type="text" name="title" class="form-control" value="{{ product.name }}" maxlength="80">
+            <div class="form-hint">Max 80 characters. Make it descriptive for eBay search.</div>
+        </div>
+        <div class="form-group">
+            <label class="form-label">Description</label>
+            <textarea name="description" class="form-control" rows="4" placeholder="Product description for eBay listing..."></textarea>
+        </div>
+        <div class="form-group">
+            <label class="form-label">Price (GBP)</label>
+            <input type="number" step="0.01" name="price" class="form-control" value="{{ product.ebay_price_gbp }}">
+        </div>
+        <div class="d-flex gap-8" style="margin-top: 16px;">
+            <button type="submit" class="btn btn-lime">
+                <span class="material-symbols-outlined">sell</span> List on eBay
+            </button>
+            <button type="button" class="btn btn-outline btn-sm" disabled title="Coming soon">
+                <span class="material-symbols-outlined">auto_awesome</span> Generate Title
+            </button>
+            <button type="button" class="btn btn-outline btn-sm" disabled title="Coming soon">
+                <span class="material-symbols-outlined">auto_awesome</span> Generate Description
+            </button>
+        </div>
+    </form>
+</div>
+
+<!-- Listings History -->
+{% if listings %}
+<div class="section-title">Listing History</div>
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th>Title</th>
+                <th>Price</th>
+                <th>Status</th>
+                <th>eBay ID</th>
+                <th>Views</th>
+                <th>Watchers</th>
+                <th>Created</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for l in listings %}
+            <tr>
+                <td>{{ l.title[:50] }}</td>
+                <td>{{ fmt_gbp(l.price_gbp) }}</td>
+                <td><span class="badge {{ status_color(l.status) }}">{{ l.status }}</span></td>
+                <td class="text-muted">{{ l.ebay_item_id or '-' }}</td>
+                <td>{{ l.views }}</td>
+                <td>{{ l.watchers }}</td>
+                <td class="text-muted">{{ fmt_datetime(l.created_at) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Sales History -->
+{% if sales %}
+<div class="section-title">Sales History</div>
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th>Buyer</th>
+                <th>Price</th>
+                <th>Status</th>
+                <th>Sold</th>
+                <th>Shipped</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in sales %}
+            <tr>
+                <td>{{ s.buyer or 'Unknown' }}</td>
+                <td class="text-lime">{{ fmt_gbp(s.price_gbp) }}</td>
+                <td><span class="badge {{ status_color(s.status) }}">{{ s.status }}</span></td>
+                <td class="text-muted">{{ fmt_datetime(s.sold_at) }}</td>
+                <td class="text-muted">{{ fmt_datetime(s.shipped_at) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Delete Product -->
+<div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border);">
+    <form method="POST" action="/product/{{ product.id }}/delete"
+          onsubmit="return confirm('Delete this product? This cannot be undone.')">
+        <button type="submit" class="btn btn-danger btn-sm">
+            <span class="material-symbols-outlined">delete</span> Delete Product
+        </button>
+    </form>
+</div>
+"""
+
+@app.route('/product/<int:product_id>')
+def product_detail(product_id):
+    product = query_db("SELECT * FROM products WHERE id = ?", (product_id,), one=True)
+    if not product:
+        flash('Product not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    pallet = None
+    if product['pallet_id']:
+        pallet = query_db(
+            "SELECT * FROM pallets WHERE id = ?",
+            (product['pallet_id'],), one=True
+        )
+
+    listings = query_db(
+        "SELECT * FROM ebay_listings WHERE product_id = ? ORDER BY created_at DESC",
+        (product_id,)
+    )
+
+    sales = query_db(
+        "SELECT * FROM sales WHERE product_id = ? ORDER BY sold_at DESC",
+        (product_id,)
+    )
+
+    return render_page(
+        TEMPLATE_PRODUCT_DETAIL_CONTENT,
+        page_title=f'{product["name"]} - eBay Hub UK',
+        active_page='pallets',
+        product=product, pallet=pallet, listings=listings, sales=sales
+    )
+
+
+# -------------------------------------------------------------------
+# Listings Template
+# -------------------------------------------------------------------
+TEMPLATE_LISTINGS_CONTENT = """
+<div class="page-header">
+    <h1><span>Listings</span></h1>
+</div>
+
+<div class="filter-tabs">
+    <a href="/listings" class="filter-tab {{ 'active' if current_filter == 'all' }}">
+        All <span class="filter-count">{{ counts.total }}</span>
+    </a>
+    <a href="/listings?status=active" class="filter-tab {{ 'active' if current_filter == 'active' }}">
+        Active <span class="filter-count">{{ counts.active }}</span>
+    </a>
+    <a href="/listings?status=draft" class="filter-tab {{ 'active' if current_filter == 'draft' }}">
+        Draft <span class="filter-count">{{ counts.draft }}</span>
+    </a>
+    <a href="/listings?status=sold" class="filter-tab {{ 'active' if current_filter == 'sold' }}">
+        Sold <span class="filter-count">{{ counts.sold }}</span>
+    </a>
+    <a href="/listings?status=ended" class="filter-tab {{ 'active' if current_filter == 'ended' }}">
+        Ended <span class="filter-count">{{ counts.ended }}</span>
+    </a>
+</div>
+
+{% if listings %}
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th></th>
+                <th>Title</th>
+                <th>Price</th>
+                <th>Status</th>
+                <th>eBay ID</th>
+                <th>Views</th>
+                <th>Watchers</th>
+                <th>Created</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for l in listings %}
+            <tr>
+                <td style="width:40px;">
+                    {% if l.image_url %}
+                    <img src="{{ l.image_url }}" style="width:36px;height:36px;object-fit:contain;border-radius:4px;"
+                         onerror="this.style.display='none'">
+                    {% endif %}
+                </td>
+                <td>
+                    {% if l.product_id %}
+                    <a href="/product/{{ l.product_id }}" class="table-link">{{ l.title[:60] }}</a>
+                    {% else %}
+                    {{ l.title[:60] }}
+                    {% endif %}
+                </td>
+                <td>{{ fmt_gbp(l.price_gbp) }}</td>
+                <td><span class="badge {{ status_color(l.status) }}">{{ l.status }}</span></td>
+                <td class="text-muted">{{ l.ebay_item_id or '-' }}</td>
+                <td>{{ l.views }}</td>
+                <td>{{ l.watchers }}</td>
+                <td class="text-muted">{{ fmt_datetime(l.created_at) }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="empty-state">
+    <span class="material-symbols-outlined">sell</span>
+    <p>No listings yet. List products from your pallets to see them here.</p>
+    <a href="/pallets" class="btn btn-cyan">
+        <span class="material-symbols-outlined">inventory_2</span> Go to Pallets
+    </a>
+</div>
+{% endif %}
+"""
+
+@app.route('/listings')
+def listings_list():
+    status_filter = request.args.get('status', 'all')
+
+    if status_filter != 'all':
+        listings = query_db("""
+            SELECT l.*, p.name as product_name, p.image_url
+            FROM ebay_listings l
+            LEFT JOIN products p ON p.id = l.product_id
+            WHERE l.status = ?
+            ORDER BY l.created_at DESC
+        """, (status_filter,))
+    else:
+        listings = query_db("""
+            SELECT l.*, p.name as product_name, p.image_url
+            FROM ebay_listings l
+            LEFT JOIN products p ON p.id = l.product_id
+            ORDER BY l.created_at DESC
+        """)
+
+    counts = query_db("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status='active' THEN 1 ELSE 0 END) as active,
+            SUM(CASE WHEN status='draft' THEN 1 ELSE 0 END) as draft,
+            SUM(CASE WHEN status='ended' THEN 1 ELSE 0 END) as ended,
+            SUM(CASE WHEN status='sold' THEN 1 ELSE 0 END) as sold
+        FROM ebay_listings
+    """, one=True)
+
+    return render_page(
+        TEMPLATE_LISTINGS_CONTENT,
+        page_title='Listings - eBay Hub UK',
+        active_page='listings',
+        listings=listings, counts=counts, current_filter=status_filter
+    )
+
+
+# -------------------------------------------------------------------
+# Orders Template
+# -------------------------------------------------------------------
+TEMPLATE_ORDERS_CONTENT = """
+<div class="page-header">
+    <h1><span>Orders</span></h1>
+</div>
+
+<div class="filter-tabs">
+    <a href="/orders" class="filter-tab {{ 'active' if current_filter == 'all' }}">
+        All <span class="filter-count">{{ counts.total }}</span>
+    </a>
+    <a href="/orders?status=new" class="filter-tab {{ 'active' if current_filter == 'new' }}">
+        To Ship <span class="filter-count" style="background:rgba(255,107,155,0.2);color:var(--pink);">{{ counts.new_orders }}</span>
+    </a>
+    <a href="/orders?status=shipped" class="filter-tab {{ 'active' if current_filter == 'shipped' }}">
+        Shipped <span class="filter-count">{{ counts.shipped }}</span>
+    </a>
+    <a href="/orders?status=delivered" class="filter-tab {{ 'active' if current_filter == 'delivered' }}">
+        Delivered <span class="filter-count">{{ counts.delivered }}</span>
+    </a>
+</div>
+
+{% if orders %}
+<div class="table-wrap">
+    <table>
+        <thead>
+            <tr>
+                <th></th>
+                <th>Product</th>
+                <th>Buyer</th>
+                <th>Price</th>
+                <th>Status</th>
+                <th>Sold</th>
+                <th>Address</th>
+                <th>Action</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for o in orders %}
+            <tr style="{{ 'background:rgba(255,107,155,0.04);' if o.status == 'new' }}">
+                <td style="width:40px;">
+                    {% if o.image_url %}
+                    <img src="{{ o.image_url }}" style="width:36px;height:36px;object-fit:contain;border-radius:4px;"
+                         onerror="this.style.display='none'">
+                    {% endif %}
+                </td>
+                <td>
+                    {% if o.product_id %}
+                    <a href="/product/{{ o.product_id }}" class="table-link">
+                        {{ o.product_name or o.listing_title or 'Product #' ~ o.product_id }}
+                    </a>
+                    {% else %}
+                    {{ o.listing_title or '-' }}
+                    {% endif %}
+                </td>
+                <td>{{ o.buyer or '-' }}</td>
+                <td class="text-lime">{{ fmt_gbp(o.price_gbp) }}</td>
+                <td><span class="badge {{ status_color(o.status) }}">{{ o.status }}</span></td>
+                <td class="text-muted">{{ fmt_datetime(o.sold_at) }}</td>
+                <td class="text-muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">
+                    {{ o.shipping_address[:60] if o.shipping_address else '-' }}
+                </td>
+                <td>
+                    {% if o.status == 'new' %}
+                    <form method="POST" action="/order/{{ o.id }}/ship" class="inline-form">
+                        <button type="submit" class="btn btn-pink btn-sm">
+                            <span class="material-symbols-outlined">local_shipping</span> Ship
+                        </button>
+                    </form>
+                    {% elif o.status == 'shipped' %}
+                    <span class="text-muted">In transit</span>
+                    {% else %}
+                    <span class="text-lime">Done</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% else %}
+<div class="empty-state">
+    <span class="material-symbols-outlined">local_shipping</span>
+    <p>No orders yet. Sales will appear here when products are sold.</p>
+</div>
+{% endif %}
+"""
+
+@app.route('/orders')
+def orders_list():
+    status_filter = request.args.get('status', 'all')
+
+    if status_filter != 'all':
+        orders = query_db("""
+            SELECT s.*, p.name as product_name, p.image_url,
+                   l.title as listing_title
+            FROM sales s
+            LEFT JOIN products p ON p.id = s.product_id
+            LEFT JOIN ebay_listings l ON l.id = s.listing_id
+            WHERE s.status = ?
+            ORDER BY s.sold_at DESC
+        """, (status_filter,))
+    else:
+        orders = query_db("""
+            SELECT s.*, p.name as product_name, p.image_url,
+                   l.title as listing_title
+            FROM sales s
+            LEFT JOIN products p ON p.id = s.product_id
+            LEFT JOIN ebay_listings l ON l.id = s.listing_id
+            ORDER BY s.sold_at DESC
+        """)
+
+    counts = query_db("""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status='new' THEN 1 ELSE 0 END) as new_orders,
+            SUM(CASE WHEN status='shipped' THEN 1 ELSE 0 END) as shipped,
+            SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) as delivered
+        FROM sales
+    """, one=True)
+
+    return render_page(
+        TEMPLATE_ORDERS_CONTENT,
+        page_title='Orders - eBay Hub UK',
+        active_page='orders',
+        orders=orders, counts=counts, current_filter=status_filter
+    )
+
+
+# -------------------------------------------------------------------
+# Settings Template
+# -------------------------------------------------------------------
+TEMPLATE_SETTINGS_CONTENT = """
+<div class="page-header">
+    <h1><span>Settings</span></h1>
+</div>
+
+<form method="POST" action="/settings">
+
+    <!-- eBay API -->
+    <div class="card mb-16">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+            <span class="material-symbols-outlined text-cyan" style="font-size:20px;">api</span>
+            eBay API Credentials
+        </div>
+        <p class="text-muted" style="font-size:0.85rem;margin:8px 0 16px 0;">
+            Get your API keys from
+            <span class="text-cyan">developer.ebay.com</span>.
+            These are required to publish listings and sync orders.
+        </p>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">App ID (Client ID)</label>
+                <input type="text" name="ebay_app_id" class="form-control"
+                       value="{{ config.ebay_app_id }}" placeholder="Your eBay App ID">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Cert ID (Client Secret)</label>
+                <input type="password" name="ebay_cert_id" class="form-control"
+                       value="{{ config.ebay_cert_id }}" placeholder="Your eBay Cert ID">
+            </div>
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">Dev ID</label>
+                <input type="text" name="ebay_dev_id" class="form-control"
+                       value="{{ config.ebay_dev_id }}" placeholder="Your eBay Dev ID">
+            </div>
+            <div class="form-group">
+                <label class="form-label">User Token</label>
+                <input type="password" name="ebay_user_token" class="form-control"
+                       value="{{ config.ebay_user_token }}" placeholder="OAuth user token">
+            </div>
+        </div>
+    </div>
+
+    <!-- Telegram -->
+    <div class="card mb-16">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+            <span class="material-symbols-outlined text-purple" style="font-size:20px;">send</span>
+            Telegram Notifications
+        </div>
+        <p class="text-muted" style="font-size:0.85rem;margin:8px 0 16px 0;">
+            Get notified about new sales and orders via Telegram bot.
+        </p>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">Bot Token</label>
+                <input type="text" name="telegram_bot_token" class="form-control"
+                       value="{{ config.telegram_bot_token }}" placeholder="123456:ABC-DEF...">
+                <div class="form-hint">Get from @BotFather on Telegram</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Chat ID</label>
+                <input type="text" name="telegram_chat_id" class="form-control"
+                       value="{{ config.telegram_chat_id }}" placeholder="-1001234567890">
+            </div>
+        </div>
+    </div>
+
+    <!-- Defaults -->
+    <div class="card mb-16">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+            <span class="material-symbols-outlined text-lime" style="font-size:20px;">tune</span>
+            Default Settings
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">Default Shipping Method</label>
+                <select name="default_shipping" class="form-control">
+                    <option value="royal_mail_2nd" {{ 'selected' if config.default_shipping == 'royal_mail_2nd' }}>Royal Mail 2nd Class</option>
+                    <option value="royal_mail_1st" {{ 'selected' if config.default_shipping == 'royal_mail_1st' }}>Royal Mail 1st Class</option>
+                    <option value="royal_mail_tracked" {{ 'selected' if config.default_shipping == 'royal_mail_tracked' }}>Royal Mail Tracked</option>
+                    <option value="hermes" {{ 'selected' if config.default_shipping == 'hermes' }}>Evri (Hermes)</option>
+                    <option value="dpd" {{ 'selected' if config.default_shipping == 'dpd' }}>DPD</option>
+                    <option value="yodel" {{ 'selected' if config.default_shipping == 'yodel' }}>Yodel</option>
+                    <option value="collect" {{ 'selected' if config.default_shipping == 'collect' }}>Collection Only</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Default Return Policy (days)</label>
+                <input type="number" name="default_return_days" class="form-control"
+                       value="{{ config.default_return_days or '30' }}" min="0">
+                <div class="form-hint">eBay UK requires minimum 14 days for consumer sales</div>
+            </div>
+        </div>
+    </div>
+
+    <button type="submit" class="btn btn-cyan">
+        <span class="material-symbols-outlined">save</span> Save Settings
+    </button>
+</form>
+"""
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings():
+    if request.method == 'POST':
+        keys = [
+            'ebay_app_id', 'ebay_cert_id', 'ebay_dev_id', 'ebay_user_token',
+            'telegram_bot_token', 'telegram_chat_id',
+            'default_shipping', 'default_return_days'
+        ]
+        for key in keys:
+            val = request.form.get(key, '')
+            set_config(key, val)
+        flash('Settings saved.', 'success')
+        return redirect(url_for('settings'))
+
+    config = {}
+    keys = [
+        'ebay_app_id', 'ebay_cert_id', 'ebay_dev_id', 'ebay_user_token',
+        'telegram_bot_token', 'telegram_chat_id',
+        'default_shipping', 'default_return_days'
+    ]
+    for key in keys:
+        config[key] = get_config(key, '')
+
+    return render_page(
+        TEMPLATE_SETTINGS_CONTENT,
+        page_title='Settings - eBay Hub UK',
+        active_page='settings',
+        config=config
+    )
+
+
+# ===================================================================
+# Run
+# ===================================================================
+
+if __name__ == '__main__':
+    print("=" * 50)
+    print("  eBay Hub UK v1.0.0")
+    print("  http://127.0.0.1:5001")
+    print("=" * 50)
+    app.run(debug=False, host='0.0.0.0', port=5001)
