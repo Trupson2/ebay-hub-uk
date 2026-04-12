@@ -252,8 +252,6 @@ def pallet_add():
     price = request.form.get('purchase_price_gbp', '0')
     date = request.form.get('purchase_date', '')
     notes = request.form.get('notes', '').strip()
-    specification = request.form.get('specification', '').strip()
-
     if not name:
         flash('Pallet name is required.', 'error')
         return redirect(url_for('pallets_list'))
@@ -269,51 +267,102 @@ def pallet_add():
         (name, supplier, price, date, notes)
     )
 
-    # Parse specification and import products if provided
+    # Import products from uploaded CSV/XLSX file
     imported = 0
-    scraped = 0
-    if specification:
-        parsed_products = parse_specification(specification)
-        for prod in parsed_products:
-            prod_name = prod['name']
-            prod_asin = prod.get('asin', '')
-            prod_ean = prod.get('ean', '')
-            prod_qty = prod.get('quantity', 1)
-            image_url = ''
-            ebay_price = 0.0
-            category = ''
-
-            # Try scraping Amazon for products with ASINs
-            if prod_asin:
-                amz_data = scrape_amazon_product(prod_asin)
-                if amz_data:
-                    if amz_data.get('title'):
-                        prod_name = amz_data['title']
-                    image_url = amz_data.get('image_url', '')
-                    if amz_data.get('price'):
-                        ebay_price = amz_data['price']
-                    category = amz_data.get('category', '')
-                    scraped += 1
+    scraped_cnt = 0
+    spec_file = request.files.get('spec_file')
+    if spec_file and spec_file.filename:
+        from modules.scraper import scrape_amazon_product, get_amazon_image_url
+        fname = spec_file.filename.lower()
+        try:
+            rows = []
+            if fname.endswith(('.xlsx', '.xls')):
+                import openpyxl
+                wb = openpyxl.load_workbook(spec_file, data_only=True)
+                ws = wb.active
+                headers = [str(c.value or '').strip().lower() for c in ws[1]]
+                for row_cells in ws.iter_rows(min_row=2, values_only=True):
+                    row = {}
+                    for i, val in enumerate(row_cells):
+                        if i < len(headers):
+                            row[headers[i]] = str(val or '').strip()
+                    rows.append(row)
+            elif fname.endswith('.csv'):
+                raw = spec_file.stream.read()
+                for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+                    try:
+                        text = raw.decode(enc)
+                        break
+                    except:
+                        continue
                 else:
-                    # Use fallback image URL
-                    image_url = get_amazon_image_url(prod_asin)
+                    text = raw.decode('utf-8', errors='replace')
+                first_line = text.split('\n')[0]
+                delimiter = ';' if first_line.count(';') > first_line.count(',') else ','
+                reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+                rows = list(reader)
 
-            execute_db(
-                "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
-                "ebay_price_gbp, category, image_url) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (pallet_id, prod_name, prod_asin, prod_ean, prod_qty,
-                 ebay_price, category, image_url)
-            )
-            imported += 1
+            def get_col(row, *names):
+                for n in names:
+                    for key in row:
+                        if key and n in key.lower():
+                            val = row[key].strip() if row[key] else ''
+                            if val and val.lower() not in ('none', 'nan', 'null'):
+                                return val
+                return ''
+
+            for row in rows:
+                prod_name = get_col(row, 'name', 'title', 'product', 'nazwa', 'description')
+                if not prod_name:
+                    continue
+                asin = get_col(row, 'asin')
+                ean = get_col(row, 'ean', 'barcode', 'upc', 'gtin')
+                try:
+                    qty = int(float(get_col(row, 'quantity', 'qty', 'ilosc', 'amount') or '1'))
+                except:
+                    qty = 1
+                cond = get_col(row, 'condition', 'state', 'stan').lower()
+                if cond not in ('new', 'like_new', 'used', 'damaged'):
+                    cond = 'new'
+                try:
+                    ebay_price = float(get_col(row, 'price', 'ebay_price', 'rrp', 'cena') or '0')
+                except:
+                    ebay_price = 0.0
+
+                image_url = get_amazon_image_url(asin) if asin else ''
+
+                # Auto-scrape Amazon UK
+                if asin:
+                    try:
+                        data = scrape_amazon_product(asin)
+                        if data:
+                            if data.get('title') and len(data['title']) > len(prod_name):
+                                prod_name = data['title']
+                            if data.get('image_url'):
+                                image_url = data['image_url']
+                            if data.get('price') and ebay_price == 0:
+                                ebay_price = data['price']
+                            scraped_cnt += 1
+                    except:
+                        pass
+
+                execute_db(
+                    "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
+                    "condition, ebay_price_gbp, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (pallet_id, prod_name, asin, ean, qty, cond, ebay_price, image_url)
+                )
+                imported += 1
+        except Exception as e:
+            flash(f'File import error: {e}', 'error')
 
     msg = f'Pallet "{name}" added successfully.'
     if imported > 0:
-        msg += f' Imported {imported} products from specification.'
-        if scraped > 0:
-            msg += f' Scraped {scraped} from Amazon.'
+        msg += f' Imported {imported} products'
+        if scraped_cnt > 0:
+            msg += f' (scraped {scraped_cnt} from Amazon UK)'
+        msg += '.'
     flash(msg, 'success')
-    return redirect(url_for('pallets_list'))
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id) if imported > 0 else url_for('pallets_list'))
 
 
 @app.route('/pallet/<int:pallet_id>/delete', methods=['POST'])
@@ -1397,7 +1446,7 @@ TEMPLATE_PALLETS_CONTENT = """
 <div id="addPalletModal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('active')">
     <div class="modal">
         <div class="modal-title">Add New Pallet</div>
-        <form method="POST" action="/pallets/add">
+        <form method="POST" action="/pallets/add" enctype="multipart/form-data">
             <div class="form-group">
                 <label class="form-label">Pallet Name *</label>
                 <input type="text" name="name" class="form-control" placeholder="e.g. Amazon Returns Batch #12" required>
@@ -1418,7 +1467,12 @@ TEMPLATE_PALLETS_CONTENT = """
             </div>
             <div class="form-group">
                 <label class="form-label">Notes</label>
-                <textarea name="notes" class="form-control" rows="3" placeholder="Optional notes..."></textarea>
+                <textarea name="notes" class="form-control" rows="2" placeholder="Optional notes..."></textarea>
+            </div>
+            <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-top:14px">
+                <label class="form-label"><span class="material-symbols-outlined" style="font-size:0.9rem;vertical-align:middle">upload_file</span> Import Specification (CSV / XLSX)</label>
+                <input type="file" name="spec_file" accept=".csv,.xlsx,.xls" class="form-control" style="padding:8px">
+                <div style="font-size:0.7rem;color:var(--text-muted);margin-top:4px">Upload supplier file with products. ASINs will be auto-scraped from Amazon UK.</div>
             </div>
             <div class="d-flex gap-8" style="justify-content: flex-end; margin-top: 20px;">
                 <button type="button" class="btn btn-outline" onclick="document.getElementById('addPalletModal').classList.remove('active')">Cancel</button>
