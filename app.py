@@ -2658,9 +2658,12 @@ def backup_create():
 @app.route('/settings/backup/restore/<backup_name>', methods=['POST'])
 def backup_restore(backup_name):
     from modules.backup import restore_backup
+    from modules.database import close_db
     ok, msg = restore_backup(backup_name)
     if ok:
-        flash(f'Database restored from {backup_name}. Restart the app for changes to take effect.', 'success')
+        # Force close current DB connection so next request uses restored DB
+        close_db()
+        flash(f'Database restored from {backup_name}.', 'success')
     else:
         flash(f'Restore failed: {msg}', 'error')
     return redirect(url_for('settings'))
@@ -2692,10 +2695,12 @@ def backup_upload():
     # Safety backup first
     create_backup()
 
-    # Save uploaded file as current DB
+    # Close current connection, replace DB, next request reconnects
+    from modules.database import close_db
+    close_db()
     db_path = Path(__file__).parent / 'ebay_hub.db'
     file.save(str(db_path))
-    flash(f'Database restored from uploaded file: {file.filename}. Restart the app.', 'success')
+    flash(f'Database restored from uploaded file: {file.filename}', 'success')
     return redirect(url_for('settings'))
 
 
