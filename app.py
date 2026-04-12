@@ -1420,10 +1420,6 @@ TEMPLATE_PALLETS_CONTENT = """
                 <label class="form-label">Notes</label>
                 <textarea name="notes" class="form-control" rows="3" placeholder="Optional notes..."></textarea>
             </div>
-            <div class="form-group">
-                <label class="form-label">Paste Specification (optional)</label>
-                <textarea name="specification" class="form-control" rows="6" placeholder="Paste product list from supplier... One product per line. ASINs will be auto-detected." style="font-family: monospace; font-size: 0.85rem;"></textarea>
-            </div>
             <div class="d-flex gap-8" style="justify-content: flex-end; margin-top: 20px;">
                 <button type="button" class="btn btn-outline" onclick="document.getElementById('addPalletModal').classList.remove('active')">Cancel</button>
                 <button type="submit" class="btn btn-cyan">
