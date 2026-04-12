@@ -229,7 +229,8 @@ def get_amazon_image_url(asin):
     """
     if not asin:
         return ''
-    return f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX300_.jpg"
+    # Try multiple Amazon image URL formats
+    return f"https://m.media-amazon.com/images/I/{asin}._AC_SL1500_.jpg"
 
 
 # ---------------------------------------------------------------------------

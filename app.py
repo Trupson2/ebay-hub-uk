@@ -1526,9 +1526,19 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
         <a href="/pallet/{{ pallet.id }}/import" class="btn btn-purple btn-sm">
             <span class="material-symbols-outlined">upload_file</span> Import CSV
         </a>
+        <form method="POST" action="/pallet/{{ pallet.id }}/scrape" class="inline-form">
+            <button type="submit" class="btn btn-cyan btn-sm">
+                <span class="material-symbols-outlined">photo_camera</span> Scrape Images
+            </button>
+        </form>
         <form method="POST" action="/pallet/{{ pallet.id }}/archive" class="inline-form">
             <button type="submit" class="btn btn-outline btn-sm">
                 <span class="material-symbols-outlined">archive</span> Archive
+            </button>
+        </form>
+        <form method="POST" action="/pallet/{{ pallet.id }}/delete" class="inline-form" onsubmit="return confirm('Delete this pallet and all its products? This cannot be undone.')">
+            <button type="submit" class="btn btn-sm" style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#ef4444">
+                <span class="material-symbols-outlined">delete</span> Delete
             </button>
         </form>
     </div>
