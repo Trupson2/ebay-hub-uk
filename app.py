@@ -47,17 +47,9 @@ def before_request():
 
 @app.after_request
 def add_security_headers(response):
-    """Add Content-Security-Policy with nonce."""
-    nonce = getattr(request, '_csp_nonce', '')
-    csp = (
-        f"default-src 'self'; "
-        f"script-src 'nonce-{nonce}' 'self' 'unsafe-inline'; "
-        f"style-src 'nonce-{nonce}' 'self' https://fonts.googleapis.com; "
-        f"font-src 'self' https://fonts.gstatic.com; "
-        f"img-src 'self' https://images-na.ssl-images-amazon.com https://i.ebayimg.com data:; "
-        f"connect-src 'self'"
-    )
-    response.headers['Content-Security-Policy'] = csp
+    """Minimal security headers — no strict CSP for simplicity."""
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
     return response
 
 
@@ -2301,6 +2293,6 @@ def settings():
 if __name__ == '__main__':
     print("=" * 50)
     print("  eBay Hub UK v1.0.0")
-    print("  http://127.0.0.1:5001")
+    print("  http://127.0.0.1:5002")
     print("=" * 50)
-    app.run(debug=False, host='0.0.0.0', port=5001)
+    app.run(debug=False, host='0.0.0.0', port=5002)
