@@ -21,6 +21,7 @@ from modules.database import (
     query_db, execute_db
 )
 from modules.ebay_api import get_ebay_client
+from modules.scraper import scrape_amazon_product, parse_specification, get_amazon_image_url
 
 # ---------------------------------------------------------------------------
 # Flask app setup
@@ -251,6 +252,7 @@ def pallet_add():
     price = request.form.get('purchase_price_gbp', '0')
     date = request.form.get('purchase_date', '')
     notes = request.form.get('notes', '').strip()
+    specification = request.form.get('specification', '').strip()
 
     if not name:
         flash('Pallet name is required.', 'error')
@@ -261,12 +263,56 @@ def pallet_add():
     except ValueError:
         price = 0.0
 
-    execute_db(
+    pallet_id = execute_db(
         "INSERT INTO pallets (name, supplier, purchase_price_gbp, purchase_date, notes) "
         "VALUES (?, ?, ?, ?, ?)",
         (name, supplier, price, date, notes)
     )
-    flash(f'Pallet "{name}" added successfully.', 'success')
+
+    # Parse specification and import products if provided
+    imported = 0
+    scraped = 0
+    if specification:
+        parsed_products = parse_specification(specification)
+        for prod in parsed_products:
+            prod_name = prod['name']
+            prod_asin = prod.get('asin', '')
+            prod_ean = prod.get('ean', '')
+            prod_qty = prod.get('quantity', 1)
+            image_url = ''
+            ebay_price = 0.0
+            category = ''
+
+            # Try scraping Amazon for products with ASINs
+            if prod_asin:
+                amz_data = scrape_amazon_product(prod_asin)
+                if amz_data:
+                    if amz_data.get('title'):
+                        prod_name = amz_data['title']
+                    image_url = amz_data.get('image_url', '')
+                    if amz_data.get('price'):
+                        ebay_price = amz_data['price']
+                    category = amz_data.get('category', '')
+                    scraped += 1
+                else:
+                    # Use fallback image URL
+                    image_url = get_amazon_image_url(prod_asin)
+
+            execute_db(
+                "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
+                "ebay_price_gbp, category, image_url) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (pallet_id, prod_name, prod_asin, prod_ean, prod_qty,
+                 ebay_price, category, image_url)
+            )
+            imported += 1
+
+    msg = f'Pallet "{name}" added successfully.'
+    if imported > 0:
+        msg += f' Imported {imported} products from specification.'
+        if scraped > 0:
+            msg += f' Scraped {scraped} from Amazon.'
+    flash(msg, 'success')
     return redirect(url_for('pallets_list'))
 
 
@@ -286,6 +332,42 @@ def pallet_delete(pallet_id):
 def pallet_archive(pallet_id):
     execute_db("UPDATE pallets SET status = 'archived' WHERE id = ?", (pallet_id,))
     flash('Pallet archived.', 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
+@app.route('/pallet/<int:pallet_id>/scrape', methods=['POST'])
+def pallet_scrape(pallet_id):
+    """Scrape Amazon UK for all products with ASINs but no image_url."""
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    products = query_db(
+        "SELECT * FROM products WHERE pallet_id = ? AND asin != '' "
+        "AND (image_url IS NULL OR image_url = '')",
+        (pallet_id,)
+    )
+
+    if not products:
+        flash('No products with ASINs needing scraping.', 'info')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    updated = 0
+    for prod in products:
+        amz_data = scrape_amazon_product(prod['asin'])
+        if amz_data:
+            new_name = amz_data.get('title') or prod['name']
+            new_image = amz_data.get('image_url', '')
+            new_price = amz_data.get('price') or prod['ebay_price_gbp']
+            execute_db(
+                "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ? "
+                "WHERE id = ?",
+                (new_name, new_image, new_price, prod['id'])
+            )
+            updated += 1
+
+    flash(f'Scraped {updated}/{len(products)} products from Amazon.', 'success')
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
@@ -1337,6 +1419,10 @@ TEMPLATE_PALLETS_CONTENT = """
             <div class="form-group">
                 <label class="form-label">Notes</label>
                 <textarea name="notes" class="form-control" rows="3" placeholder="Optional notes..."></textarea>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Paste Specification (optional)</label>
+                <textarea name="specification" class="form-control" rows="6" placeholder="Paste product list from supplier... One product per line. ASINs will be auto-detected." style="font-family: monospace; font-size: 0.85rem;"></textarea>
             </div>
             <div class="d-flex gap-8" style="justify-content: flex-end; margin-top: 20px;">
                 <button type="button" class="btn btn-outline" onclick="document.getElementById('addPalletModal').classList.remove('active')">Cancel</button>
