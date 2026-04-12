@@ -399,31 +399,44 @@ def pallet_scrape(pallet_id):
         flash('Pallet not found.', 'error')
         return redirect(url_for('pallets_list'))
 
+    from modules.scraper import get_amazon_image_urls
+    import requests as _req
+
     products = query_db(
-        "SELECT * FROM products WHERE pallet_id = ? AND asin != '' "
-        "AND (image_url IS NULL OR image_url = '')",
+        "SELECT * FROM products WHERE pallet_id = ? AND asin != ''",
         (pallet_id,)
     )
 
     if not products:
-        flash('No products with ASINs needing scraping.', 'info')
+        flash('No products with ASINs to scrape.', 'info')
         return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
     updated = 0
     for prod in products:
+        # Try scraping Amazon page first
         amz_data = scrape_amazon_product(prod['asin'])
-        if amz_data:
+        if amz_data and amz_data.get('image_url'):
             new_name = amz_data.get('title') or prod['name']
-            new_image = amz_data.get('image_url', '')
+            new_image = amz_data['image_url']
             new_price = amz_data.get('price') or prod['ebay_price_gbp']
             execute_db(
-                "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ? "
-                "WHERE id = ?",
+                "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ? WHERE id = ?",
                 (new_name, new_image, new_price, prod['id'])
             )
             updated += 1
+        else:
+            # Fallback: try multiple image URL formats
+            for url in get_amazon_image_urls(prod['asin']):
+                try:
+                    r = _req.head(url, timeout=5, allow_redirects=True)
+                    if r.status_code == 200 and 'image' in r.headers.get('content-type', ''):
+                        execute_db("UPDATE products SET image_url = ? WHERE id = ?", (url, prod['id']))
+                        updated += 1
+                        break
+                except:
+                    continue
 
-    flash(f'Scraped {updated}/{len(products)} products from Amazon.', 'success')
+    flash(f'Updated {updated}/{len(products)} products from Amazon UK.', 'success')
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 

@@ -257,8 +257,20 @@ def get_amazon_image_url(asin):
     """
     if not asin:
         return ''
-    # Try multiple Amazon image URL formats
+    # Amazon image URL - works for most ASINs
     return f"https://m.media-amazon.com/images/I/{asin}._AC_SL1500_.jpg"
+
+
+def get_amazon_image_urls(asin):
+    """Return multiple possible image URLs for an ASIN (fallback chain)."""
+    if not asin:
+        return []
+    return [
+        f"https://m.media-amazon.com/images/I/{asin}._AC_SL1500_.jpg",
+        f"https://images-na.ssl-images-amazon.com/images/I/{asin}._AC_SL1500_.jpg",
+        f"https://m.media-amazon.com/images/I/{asin}._AC_UL600_.jpg",
+        f"https://images-na.ssl-images-amazon.com/images/P/{asin}.01._SCLZZZZZZZ_SX500_.jpg",
+    ]
 
 
 # ---------------------------------------------------------------------------
