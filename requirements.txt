@@ -2,3 +2,4 @@ flask
 flask-wtf
 requests
 beautifulsoup4
+openpyxl

@@ -1660,14 +1660,14 @@ TEMPLATE_CSV_IMPORT_CONTENT = """
         <span class="text-muted">/</span>
         <a href="/pallet/{{ pallet.id }}" class="text-muted" style="text-decoration: none;">{{ pallet.name }}</a>
         <span class="text-muted">/</span>
-        <span>Import CSV</span>
+        <span>Import</span>
     </h1>
 </div>
 
 <div class="card">
-    <div class="card-title">Upload CSV File</div>
+    <div class="card-title">Upload Specification (CSV or Excel)</div>
     <p style="margin: 12px 0; color: var(--text-muted); font-size: 0.9rem;">
-        Upload a CSV file with product data. The file should have headers matching these columns:
+        Upload the CSV or XLSX file from your joblot supplier. The app will auto-detect columns and scrape product data from Amazon UK.
     </p>
 
     <div class="table-wrap mb-16">
@@ -1680,20 +1680,26 @@ TEMPLATE_CSV_IMPORT_CONTENT = """
                 </tr>
             </thead>
             <tbody>
-                <tr><td>name <span class="text-muted">or</span> title</td><td><span class="text-lime">Yes</span></td><td>Product name</td></tr>
-                <tr><td>asin</td><td><span class="text-muted">No</span></td><td>Amazon ASIN (for image)</td></tr>
-                <tr><td>ean</td><td><span class="text-muted">No</span></td><td>EAN / Barcode</td></tr>
-                <tr><td>quantity</td><td><span class="text-muted">No</span></td><td>Quantity (default: 1)</td></tr>
-                <tr><td>condition</td><td><span class="text-muted">No</span></td><td>new / like_new / used / damaged</td></tr>
-                <tr><td>price <span class="text-muted">or</span> ebay_price</td><td><span class="text-muted">No</span></td><td>eBay listing price in GBP</td></tr>
+                <tr><td>name / title / product</td><td><span class="text-lime">Yes</span></td><td>Product name</td></tr>
+                <tr><td>asin</td><td><span class="text-muted">No</span></td><td>Amazon ASIN (for auto-scrape)</td></tr>
+                <tr><td>ean / barcode</td><td><span class="text-muted">No</span></td><td>EAN / Barcode</td></tr>
+                <tr><td>quantity / qty</td><td><span class="text-muted">No</span></td><td>Quantity (default: 1)</td></tr>
+                <tr><td>condition / state</td><td><span class="text-muted">No</span></td><td>new / like_new / used / damaged</td></tr>
+                <tr><td>price / ebay_price / rrp</td><td><span class="text-muted">No</span></td><td>Price in GBP</td></tr>
             </tbody>
         </table>
     </div>
 
     <form method="POST" enctype="multipart/form-data" action="/pallet/{{ pallet.id }}/import">
         <div class="form-group">
-            <label class="form-label">Select CSV File</label>
-            <input type="file" name="csv_file" accept=".csv" class="form-control" required>
+            <label class="form-label">Select file (CSV or XLSX)</label>
+            <input type="file" name="csv_file" accept=".csv,.xlsx,.xls" class="form-control" required>
+        </div>
+        <div class="form-group" style="margin-top: 12px;">
+            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.85rem; color: var(--text-muted);">
+                <input type="checkbox" name="auto_scrape" value="1" checked style="accent-color: #8ff5ff;">
+                Auto-scrape Amazon UK for products with ASIN (images, titles, prices)
+            </label>
         </div>
         <div class="d-flex gap-8" style="margin-top: 20px;">
             <a href="/pallet/{{ pallet.id }}" class="btn btn-outline">Cancel</a>
@@ -1714,43 +1720,122 @@ def csv_import(pallet_id):
 
     if request.method == 'POST':
         file = request.files.get('csv_file')
-        if not file or not file.filename.endswith('.csv'):
-            flash('Please upload a valid CSV file.', 'error')
+        if not file or not file.filename:
+            flash('Please upload a file.', 'error')
             return redirect(url_for('csv_import', pallet_id=pallet_id))
 
+        fname = file.filename.lower()
+        auto_scrape = request.form.get('auto_scrape') == '1'
+
         try:
-            stream = io.StringIO(file.stream.read().decode('utf-8-sig'))
-            reader = csv.DictReader(stream)
+            rows = []
+
+            # Parse XLSX
+            if fname.endswith(('.xlsx', '.xls')):
+                try:
+                    import openpyxl
+                except ImportError:
+                    flash('openpyxl not installed. Run: pip install openpyxl', 'error')
+                    return redirect(url_for('csv_import', pallet_id=pallet_id))
+                wb = openpyxl.load_workbook(file, data_only=True)
+                ws = wb.active
+                # Find header row (first row with text)
+                headers = []
+                for cell in ws[1]:
+                    headers.append(str(cell.value or '').strip().lower())
+                for row_cells in ws.iter_rows(min_row=2, values_only=True):
+                    row = {}
+                    for i, val in enumerate(row_cells):
+                        if i < len(headers):
+                            row[headers[i]] = str(val or '').strip()
+                    rows.append(row)
+
+            # Parse CSV
+            elif fname.endswith('.csv'):
+                raw = file.stream.read()
+                # Try UTF-8 first, fallback to latin-1
+                for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+                    try:
+                        text = raw.decode(enc)
+                        break
+                    except:
+                        continue
+                else:
+                    text = raw.decode('utf-8', errors='replace')
+                # Detect delimiter
+                first_line = text.split('\n')[0]
+                delimiter = ';' if first_line.count(';') > first_line.count(',') else ','
+                reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
+                rows = list(reader)
+            else:
+                flash('Unsupported file format. Use CSV or XLSX.', 'error')
+                return redirect(url_for('csv_import', pallet_id=pallet_id))
+
+            # Column name mapping (flexible)
+            def get_col(row, *names):
+                for n in names:
+                    for key in row:
+                        if key and n in key.lower():
+                            val = row[key].strip() if row[key] else ''
+                            if val and val.lower() not in ('none', 'nan', 'null'):
+                                return val
+                return ''
+
             count = 0
-            for row in reader:
-                name = row.get('name', row.get('title', '')).strip()
+            scraped = 0
+            from modules.scraper import scrape_amazon_product, get_amazon_image_url
+
+            for row in rows:
+                name = get_col(row, 'name', 'title', 'product', 'nazwa', 'description')
                 if not name:
                     continue
-                asin = row.get('asin', '').strip()
-                ean = row.get('ean', '').strip()
+
+                asin = get_col(row, 'asin')
+                ean = get_col(row, 'ean', 'barcode', 'upc', 'gtin')
                 try:
-                    qty = int(row.get('quantity', '1').strip())
-                except ValueError:
+                    qty = int(float(get_col(row, 'quantity', 'qty', 'ilosc', 'amount') or '1'))
+                except:
                     qty = 1
-                cond = row.get('condition', 'new').strip().lower()
+                cond = get_col(row, 'condition', 'state', 'stan').lower()
                 if cond not in ('new', 'like_new', 'used', 'damaged'):
                     cond = 'new'
                 try:
-                    price = float(row.get('price', row.get('ebay_price', '0')).strip())
-                except ValueError:
+                    price = float(get_col(row, 'price', 'ebay_price', 'rrp', 'cena') or '0')
+                except:
                     price = 0.0
+
+                image_url = get_amazon_image_url(asin) if asin else ''
+
+                # Auto-scrape Amazon UK for products with ASIN
+                if auto_scrape and asin:
+                    try:
+                        data = scrape_amazon_product(asin)
+                        if data:
+                            if data.get('title') and len(data['title']) > len(name):
+                                name = data['title']
+                            if data.get('image_url'):
+                                image_url = data['image_url']
+                            if data.get('price') and price == 0:
+                                price = data['price']
+                            scraped += 1
+                    except Exception as e:
+                        print(f"[WARN] Scrape failed for {asin}: {e}")
 
                 execute_db(
                     "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
                     "condition, ebay_price_gbp, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (pallet_id, name, asin, ean, qty, cond, price, amazon_image(asin))
+                    (pallet_id, name, asin, ean, qty, cond, price, image_url)
                 )
                 count += 1
 
-            flash(f'Imported {count} products from CSV.', 'success')
+            msg = f'Imported {count} products'
+            if scraped > 0:
+                msg += f' (scraped {scraped} from Amazon UK)'
+            flash(msg + '.', 'success')
             return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
         except Exception as e:
-            flash(f'Error reading CSV: {e}', 'error')
+            flash(f'Error importing file: {e}', 'error')
             return redirect(url_for('csv_import', pallet_id=pallet_id))
 
     return render_page(
