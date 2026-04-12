@@ -2542,6 +2542,14 @@ def settings():
 # ===================================================================
 
 if __name__ == '__main__':
+    # Start backup scheduler
+    try:
+        from modules.backup import start_backup_scheduler, create_backup
+        start_backup_scheduler()
+        create_backup()  # Initial backup on start
+    except Exception as e:
+        print(f"[WARN] Backup init error: {e}")
+
     print("=" * 50)
     print("  eBay Hub UK v1.0.0")
     print("  http://127.0.0.1:5002")

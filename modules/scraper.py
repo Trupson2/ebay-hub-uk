@@ -20,13 +20,25 @@ AMAZON_DOMAINS = [
     ("amazon.co.uk", "GBP"),
     ("amazon.com", "USD"),
     ("amazon.de", "EUR"),
+    ("amazon.pl", "PLN"),
+    ("amazon.fr", "EUR"),
+    ("amazon.it", "EUR"),
+    ("amazon.es", "EUR"),
+    ("amazon.nl", "EUR"),
+    ("amazon.se", "SEK"),
 ]
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
-)
+import random
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+]
+
+USER_AGENT = USER_AGENTS[0]
 
 HEADERS = {
     "User-Agent": USER_AGENT,
@@ -60,9 +72,16 @@ PRICE_RE = re.compile(r'[\u00a3$\u20ac]\s*([\d,]+\.?\d*)')
 # ---------------------------------------------------------------------------
 
 def _create_session():
-    """Create a requests session with proper headers."""
+    """Create a requests session with randomized headers to avoid blocks."""
     session = requests.Session()
-    session.headers.update(HEADERS)
+    headers = HEADERS.copy()
+    headers['User-Agent'] = random.choice(USER_AGENTS)
+    session.headers.update(headers)
+    # Visit homepage first to get cookies (anti-CAPTCHA)
+    try:
+        session.get('https://www.amazon.co.uk/', timeout=8, allow_redirects=True)
+    except:
+        pass
     return session
 
 
@@ -175,16 +194,25 @@ def scrape_amazon_product(asin):
     for domain, currency in AMAZON_DOMAINS:
         url = f"https://www.{domain}/dp/{asin}"
         try:
+            # Random delay to avoid rate limiting
+            time.sleep(random.uniform(1.5, 3.5))
+
+            # Visit domain homepage first for cookies
+            try:
+                session.get(f"https://www.{domain}/ref=cs_503_link", timeout=8, allow_redirects=True)
+            except:
+                pass
+
             resp = session.get(url, timeout=15, allow_redirects=True)
 
-            if resp.status_code == 503 or 'captcha' in resp.text.lower():
-                logger.warning(f"CAPTCHA/503 on {domain} for {asin}, trying next domain")
-                time.sleep(1)
+            if resp.status_code == 503 or 'captcha' in resp.text.lower() or 'robot check' in resp.text.lower():
+                print(f"[SCRAPE] CAPTCHA on {domain} for {asin}, trying next...")
+                time.sleep(2)
                 continue
 
             if resp.status_code != 200:
-                logger.warning(f"HTTP {resp.status_code} from {domain} for {asin}")
-                time.sleep(0.5)
+                print(f"[SCRAPE] HTTP {resp.status_code} from {domain} for {asin}")
+                time.sleep(1)
                 continue
 
             soup = BeautifulSoup(resp.text, 'html.parser')
