@@ -2531,6 +2531,82 @@ TEMPLATE_SETTINGS_CONTENT = """
         <span class="material-symbols-outlined">save</span> Save Settings
     </button>
 </form>
+
+<!-- Backups -->
+<div class="card mb-16" style="margin-top:24px">
+    <div class="card-title" style="display:flex;align-items:center;justify-content:space-between;">
+        <div style="display:flex;align-items:center;gap:8px;">
+            <span class="material-symbols-outlined text-lime" style="font-size:20px;">backup</span>
+            Database Backups
+        </div>
+        <form method="POST" action="/settings/backup/create" class="inline-form">
+            <button type="submit" class="btn btn-lime btn-sm">
+                <span class="material-symbols-outlined">add_circle</span> Create Backup Now
+            </button>
+        </form>
+    </div>
+    <p class="text-muted" style="font-size:0.8rem;margin:8px 0 16px 0;">
+        Auto-backup runs every hour. Max 48 backups kept (2 days).
+    </p>
+
+    {% if backups %}
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Date</th>
+                    <th>Size</th>
+                    <th>File</th>
+                    <th style="text-align:right">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for b in backups[:15] %}
+                <tr>
+                    <td>{{ b.date }}</td>
+                    <td>{{ b.size_mb }} MB</td>
+                    <td style="font-size:0.75rem;color:var(--text-muted);font-family:monospace">{{ b.name }}</td>
+                    <td style="text-align:right">
+                        <div class="d-flex gap-8" style="justify-content:flex-end">
+                            <a href="/settings/backup/download/{{ b.name }}" class="btn btn-outline btn-sm" style="padding:4px 10px;font-size:0.7rem">
+                                <span class="material-symbols-outlined" style="font-size:0.85rem">download</span> Download
+                            </a>
+                            <form method="POST" action="/settings/backup/restore/{{ b.name }}" class="inline-form" onsubmit="return confirm('Restore database from {{ b.name }}?\\n\\nCurrent data will be backed up first.')">
+                                <button type="submit" class="btn btn-sm" style="padding:4px 10px;font-size:0.7rem;background:rgba(245,158,11,0.15);border:1px solid rgba(245,158,11,0.3);color:#f59e0b">
+                                    <span class="material-symbols-outlined" style="font-size:0.85rem">restore</span> Restore
+                                </button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% if backups|length > 15 %}
+    <div style="text-align:center;padding:8px;color:var(--text-muted);font-size:0.75rem">Showing 15 of {{ backups|length }} backups</div>
+    {% endif %}
+    {% else %}
+    <div style="text-align:center;padding:20px;color:var(--text-muted)">No backups yet. Click "Create Backup Now" to make one.</div>
+    {% endif %}
+</div>
+
+<!-- Upload Backup -->
+<div class="card mb-16">
+    <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+        <span class="material-symbols-outlined text-purple" style="font-size:20px;">upload_file</span>
+        Upload Backup
+    </div>
+    <form method="POST" action="/settings/backup/upload" enctype="multipart/form-data">
+        <div class="form-group">
+            <label class="form-label">Upload a .db backup file to restore</label>
+            <input type="file" name="backup_file" accept=".db" class="form-control" required style="padding:8px">
+        </div>
+        <button type="submit" class="btn btn-purple btn-sm" onclick="return confirm('Upload and restore this backup?\\n\\nCurrent data will be backed up first.')">
+            <span class="material-symbols-outlined">upload</span> Upload & Restore
+        </button>
+    </form>
+</div>
 """
 
 @app.route('/settings', methods=['GET', 'POST'])
@@ -2556,12 +2632,71 @@ def settings():
     for key in keys:
         config[key] = get_config(key, '')
 
+    from modules.backup import get_backups
+    backups = get_backups()
+
     return render_page(
         TEMPLATE_SETTINGS_CONTENT,
         page_title='Settings - eBay Hub UK',
         active_page='settings',
-        config=config
+        config=config,
+        backups=backups
     )
+
+
+@app.route('/settings/backup/create', methods=['POST'])
+def backup_create():
+    from modules.backup import create_backup
+    result = create_backup()
+    if result:
+        flash(f'Backup created: {result.name}', 'success')
+    else:
+        flash('Backup failed!', 'error')
+    return redirect(url_for('settings'))
+
+
+@app.route('/settings/backup/restore/<backup_name>', methods=['POST'])
+def backup_restore(backup_name):
+    from modules.backup import restore_backup
+    ok, msg = restore_backup(backup_name)
+    if ok:
+        flash(f'Database restored from {backup_name}. Restart the app for changes to take effect.', 'success')
+    else:
+        flash(f'Restore failed: {msg}', 'error')
+    return redirect(url_for('settings'))
+
+
+@app.route('/settings/backup/download/<backup_name>')
+def backup_download(backup_name):
+    from pathlib import Path
+    backup_dir = Path(__file__).parent / 'backups'
+    backup_path = backup_dir / backup_name
+    if not backup_path.exists() or '..' in backup_name:
+        flash('Backup not found.', 'error')
+        return redirect(url_for('settings'))
+    from flask import send_file
+    return send_file(str(backup_path), as_attachment=True, download_name=backup_name)
+
+
+@app.route('/settings/backup/upload', methods=['POST'])
+def backup_upload():
+    from modules.backup import create_backup
+    from pathlib import Path
+    import shutil
+
+    file = request.files.get('backup_file')
+    if not file or not file.filename.endswith('.db'):
+        flash('Please upload a .db file.', 'error')
+        return redirect(url_for('settings'))
+
+    # Safety backup first
+    create_backup()
+
+    # Save uploaded file as current DB
+    db_path = Path(__file__).parent / 'ebay_hub.db'
+    file.save(str(db_path))
+    flash(f'Database restored from uploaded file: {file.filename}. Restart the app.', 'success')
+    return redirect(url_for('settings'))
 
 
 # ===================================================================
