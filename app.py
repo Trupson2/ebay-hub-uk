@@ -303,9 +303,16 @@ def pallet_add():
                 rows = list(reader)
 
             def get_col(row, *names):
+                # Exact match first, then substring
                 for n in names:
                     for key in row:
-                        if key and n in key.lower():
+                        if key and key.lower().strip() == n:
+                            val = row[key].strip() if row[key] else ''
+                            if val and val.lower() not in ('none', 'nan', 'null'):
+                                return val
+                for n in names:
+                    for key in row:
+                        if key and n in key.lower() and 'category' not in key.lower():
                             val = row[key].strip() if row[key] else ''
                             if val and val.lower() not in ('none', 'nan', 'null'):
                                 return val
@@ -315,7 +322,7 @@ def pallet_add():
                 prod_name = get_col(row, 'name', 'title', 'product', 'nazwa', 'description')
                 if not prod_name:
                     continue
-                asin = get_col(row, 'asin')
+                asin = get_col(row, 'asin').upper()
                 ean = get_col(row, 'ean', 'barcode', 'upc', 'gtin')
                 try:
                     qty = int(float(get_col(row, 'quantity', 'qty', 'ilosc', 'amount') or '1'))
@@ -1823,9 +1830,16 @@ def csv_import(pallet_id):
 
             # Column name mapping (flexible)
             def get_col(row, *names):
+                # Exact match first, then substring
                 for n in names:
                     for key in row:
-                        if key and n in key.lower():
+                        if key and key.lower().strip() == n:
+                            val = row[key].strip() if row[key] else ''
+                            if val and val.lower() not in ('none', 'nan', 'null'):
+                                return val
+                for n in names:
+                    for key in row:
+                        if key and n in key.lower() and 'category' not in key.lower():
                             val = row[key].strip() if row[key] else ''
                             if val and val.lower() not in ('none', 'nan', 'null'):
                                 return val
@@ -1840,7 +1854,7 @@ def csv_import(pallet_id):
                 if not name:
                     continue
 
-                asin = get_col(row, 'asin')
+                asin = get_col(row, 'asin').upper()
                 ean = get_col(row, 'ean', 'barcode', 'upc', 'gtin')
                 try:
                     qty = int(float(get_col(row, 'quantity', 'qty', 'ilosc', 'amount') or '1'))
