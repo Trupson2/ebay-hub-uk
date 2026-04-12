@@ -29,6 +29,7 @@ from modules.scraper import scrape_amazon_product, parse_specification, get_amaz
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+app.permanent_session_lifetime = timedelta(days=7)
 
 # Initialise database on first request
 with app.app_context():
@@ -42,8 +43,66 @@ def teardown_db(exception):
 
 @app.before_request
 def before_request():
-    """Attach a CSP nonce to each request."""
+    """Attach CSP nonce and check authentication."""
     request._csp_nonce = secrets.token_hex(16)
+
+    # Simple PIN/password auth
+    if request.path.startswith('/static') or request.path == '/login':
+        return
+    if not session.get('authenticated'):
+        pin = get_config('app_pin', '')
+        if pin:  # PIN is set — require login
+            return redirect('/login')
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        entered = request.form.get('pin', '')
+        stored = get_config('app_pin', '')
+        if entered == stored:
+            session['authenticated'] = True
+            session.permanent = True
+            flash('Welcome back!', 'success')
+            return redirect('/')
+        else:
+            flash('Wrong PIN.', 'error')
+    return render_template_string(LOGIN_TEMPLATE)
+
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect('/login')
+
+
+LOGIN_TEMPLATE = """<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login - eBay Hub UK</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a14;color:#e2e8f0;font-family:'Space Grotesk',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh}
+.login-box{background:rgba(15,15,30,0.8);border:1px solid rgba(143,245,255,0.12);padding:40px;max-width:360px;width:90%;text-align:center}
+h1{font-size:1.4rem;color:#8ff5ff;margin-bottom:8px}
+p{color:#64748b;font-size:0.85rem;margin-bottom:24px}
+input{width:100%;padding:14px;background:#0a0a14;border:1px solid rgba(143,245,255,0.15);color:#e2e8f0;font-size:1.2rem;text-align:center;letter-spacing:8px;font-family:'Space Grotesk',sans-serif;margin-bottom:16px}
+input:focus{outline:none;border-color:#8ff5ff}
+button{width:100%;padding:14px;background:#8ff5ff;color:#0a0a14;border:none;font-weight:700;font-size:1rem;cursor:pointer;font-family:'Space Grotesk',sans-serif}
+button:hover{background:#beee00}
+.flash{padding:10px;margin-bottom:16px;font-size:0.85rem;background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#ef4444}
+</style></head><body>
+<div class="login-box">
+<h1>eBay Hub UK</h1>
+<p>Enter your PIN to continue</p>
+{% with messages = get_flashed_messages() %}{% if messages %}{% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}{% endif %}{% endwith %}
+<form method="POST">
+<input type="password" name="pin" placeholder="PIN" autofocus required>
+<button type="submit">Unlock</button>
+</form>
+</div>
+</body></html>"""
 
 
 @app.after_request
@@ -1249,6 +1308,9 @@ TEMPLATE_BASE = """<!DOCTYPE html>
             <a href="/settings" class="{{ 'active' if active_page == 'settings' else '' }}">
                 <span class="material-symbols-outlined">settings</span>
                 <span class="nav-text">Settings</span>
+            </a>
+            <a href="/logout" style="color:#ef4444">
+                <span class="material-symbols-outlined">logout</span>
             </a>
         </div>
     </div>
@@ -2512,6 +2574,22 @@ TEMPLATE_SETTINGS_CONTENT = """
         </div>
     </div>
 
+    <!-- Security -->
+    <div class="card mb-16">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+            <span class="material-symbols-outlined" style="font-size:20px;color:#ef4444">lock</span>
+            Security
+        </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">App PIN (required to access)</label>
+                <input type="password" name="app_pin" class="form-control"
+                       value="{{ config.app_pin }}" placeholder="Set a PIN (e.g. 1234)">
+                <div class="form-hint">Leave empty to disable PIN protection</div>
+            </div>
+        </div>
+    </div>
+
     <!-- Defaults -->
     <div class="card mb-16">
         <div class="card-title" style="display:flex;align-items:center;gap:8px;">
@@ -2626,6 +2704,7 @@ TEMPLATE_SETTINGS_CONTENT = """
 def settings():
     if request.method == 'POST':
         keys = [
+            'app_pin',
             'ebay_app_id', 'ebay_cert_id', 'ebay_dev_id', 'ebay_user_token',
             'telegram_bot_token', 'telegram_chat_id',
             'default_shipping', 'default_return_days'
