@@ -51,7 +51,7 @@ def add_security_headers(response):
     nonce = getattr(request, '_csp_nonce', '')
     csp = (
         f"default-src 'self'; "
-        f"script-src 'nonce-{nonce}' 'self'; "
+        f"script-src 'nonce-{nonce}' 'self' 'unsafe-inline'; "
         f"style-src 'nonce-{nonce}' 'self' https://fonts.googleapis.com; "
         f"font-src 'self' https://fonts.gstatic.com; "
         f"img-src 'self' https://images-na.ssl-images-amazon.com https://i.ebayimg.com data:; "
