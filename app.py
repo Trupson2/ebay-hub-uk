@@ -499,6 +499,30 @@ def pallet_scrape(pallet_id):
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
+@app.route('/pallet/<int:pallet_id>/mass-price', methods=['POST'])
+def pallet_mass_price(pallet_id):
+    """Save prices for all products in pallet at once."""
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    updated = 0
+    for key, value in request.form.items():
+        if key.startswith('price_'):
+            try:
+                pid = int(key.replace('price_', ''))
+                price = float(value or 0)
+                execute_db("UPDATE products SET ebay_price_gbp = ? WHERE id = ? AND pallet_id = ?",
+                          (price, pid, pallet_id))
+                updated += 1
+            except (ValueError, TypeError):
+                continue
+
+    flash(f'Updated prices for {updated} products.', 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
 @app.route('/pallet/<int:pallet_id>/list-all', methods=['POST'])
 def pallet_list_all_ebay(pallet_id):
     """Mass-list all warehouse products on eBay."""
@@ -1802,6 +1826,51 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
     <p>{{ pallet.notes }}</p>
 </div>
 {% endif %}
+
+<!-- Mass Price Editor -->
+<div class="card mb-16">
+    <div class="flex-between" style="margin-bottom:12px">
+        <div class="card-title" style="margin:0"><span class="material-symbols-outlined" style="font-size:18px;vertical-align:middle">paid</span> Set Prices</div>
+        <div class="d-flex gap-8">
+            <button onclick="applyMultiplier()" class="btn btn-outline btn-sm" style="font-size:0.7rem">Apply Multiplier</button>
+            <button onclick="document.getElementById('massPriceForm').submit()" class="btn btn-lime btn-sm">
+                <span class="material-symbols-outlined">save</span> Save All Prices
+            </button>
+        </div>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;font-size:0.8rem;color:var(--text-muted)">
+        <label>Multiplier: cost &times;</label>
+        <input type="number" id="priceMultiplier" value="2.5" step="0.1" min="1" style="width:70px;padding:6px;background:var(--bg);border:1px solid var(--border);color:var(--text);text-align:center;font-size:0.85rem">
+        <span style="color:var(--text-muted);font-size:0.7rem">(e.g. 2.5 = 150% markup)</span>
+    </div>
+    <form method="POST" action="/pallet/{{ pallet.id }}/mass-price" id="massPriceForm">
+        <div style="display:grid;grid-template-columns:1fr 100px;gap:6px;font-size:0.75rem;color:var(--text-muted);padding:0 4px;margin-bottom:4px">
+            <div>Product</div>
+            <div style="text-align:center">Price (GBP)</div>
+        </div>
+        {% for p in products %}
+        <div style="display:grid;grid-template-columns:1fr 100px;gap:6px;align-items:center;padding:6px 4px;border-bottom:1px solid rgba(255,255,255,0.04)">
+            <div style="font-size:0.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="{{ p.name }}">{{ p.name[:45] }}</div>
+            <input type="number" name="price_{{ p.id }}" value="{{ '%.2f'|format(p.ebay_price_gbp or 0) }}" step="0.01" min="0" class="mass-price-input" data-pid="{{ p.id }}"
+                   style="padding:6px;background:var(--bg);border:1px solid var(--border);color:#8ff5ff;text-align:center;font-size:0.85rem;font-weight:700;font-family:'Space Grotesk',sans-serif">
+        </div>
+        {% endfor %}
+    </form>
+</div>
+
+<script>
+function applyMultiplier() {
+    var mult = parseFloat(document.getElementById('priceMultiplier').value) || 2.5;
+    var palletCost = {{ pallet.purchase_price_gbp or 0 }};
+    var productCount = {{ products|length or 1 }};
+    var costPerUnit = palletCost / Math.max(productCount, 1);
+    document.querySelectorAll('.mass-price-input').forEach(function(inp) {
+        inp.value = (costPerUnit * mult).toFixed(2);
+        inp.style.borderColor = '#beee00';
+        setTimeout(function(){ inp.style.borderColor = ''; }, 1000);
+    });
+}
+</script>
 
 <!-- Add Product -->
 <div class="flex-between mb-16">
