@@ -213,6 +213,7 @@ class EbayAPI:
         <ConditionID>{condition_id}</ConditionID>
         <CategoryMappingAllowed>true</CategoryMappingAllowed>
         <Country>GB</Country>
+        <Location>United Kingdom</Location>
         <Currency>GBP</Currency>
         <DispatchTimeMax>{dispatch_days}</DispatchTimeMax>
         <ListingDuration>GTC</ListingDuration>
