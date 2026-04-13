@@ -2435,14 +2435,14 @@ function generateAI(type) {
     var oldText = btn.innerHTML;
     btn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> Generating...';
     btn.disabled = true;
-    var name = document.querySelector('[name="listing_title"]').value || '{{ product.name }}';
+    var name = document.querySelector('[name="title"]').value || '{{ product.name }}';
     fetch('/api/generate-' + type, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({product_name: name, condition: '{{ product.condition }}'})
     }).then(r => r.json()).then(d => {
         if (d.ok) {
-            if (type === 'title') document.querySelector('[name="listing_title"]').value = d.text;
+            if (type === 'title') document.querySelector('[name="title"]').value = d.text;
             else document.querySelector('[name="description"]').value = d.text;
             btn.innerHTML = '<span class="material-symbols-outlined">check</span> Done!';
             setTimeout(() => { btn.innerHTML = oldText; btn.disabled = false; }, 2000);
