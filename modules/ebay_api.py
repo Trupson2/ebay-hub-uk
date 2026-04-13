@@ -33,10 +33,10 @@ CONDITION_MAP = {
 SHIPPING_SERVICE_MAP = {
     'royal_mail_2nd': ('UK_RoyalMailSecondClassStandard', 2.99),
     'royal_mail_1st': ('UK_RoyalMailFirstClassStandard', 3.99),
-    'royal_mail_tracked': ('UK_RoyalMailTracked', 4.49),
-    'hermes': ('UK_Hermes', 3.49),
-    'dpd': ('UK_DPDNextDay', 5.99),
-    'yodel': ('UK_YodelDirect', 4.99),
+    'royal_mail_tracked': ('UK_RoyalMailAirmailInternational', 4.49),
+    'hermes': ('UK_OtherCourier', 3.49),
+    'dpd': ('UK_OtherCourier', 5.99),
+    'yodel': ('UK_OtherCourier', 4.99),
     'collect': ('UK_CollectInPerson', 0.00),
 }
 
@@ -251,6 +251,8 @@ class EbayAPI:
                 <ShippingServicePriority>1</ShippingServicePriority>
                 <ShippingService>{shipping_service}</ShippingService>
                 <ShippingServiceCost currencyID="GBP">{shipping_cost:.2f}</ShippingServiceCost>
+                <ShippingServiceAdditionalCost currencyID="GBP">{shipping_cost:.2f}</ShippingServiceAdditionalCost>
+                {'<FreeShipping>true</FreeShipping>' if shipping_cost == 0 else ''}
             </ShippingServiceOptions>
         </ShippingDetails>
         <Site>UK</Site>
