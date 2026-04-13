@@ -1504,6 +1504,9 @@ TEMPLATE_BASE = """<!DOCTYPE html>
                 <span class="material-symbols-outlined">settings</span>
                 <span class="nav-text">Settings</span>
             </a>
+            <a href="/help" class="{{ 'active' if active_page == 'help' else '' }}">
+                <span class="material-symbols-outlined">help</span>
+            </a>
             <a href="/logout" style="color:#ef4444">
                 <span class="material-symbols-outlined">logout</span>
             </a>
@@ -3209,6 +3212,75 @@ def backup_upload():
 
 
 # ===================================================================
+# Help Page
+# ===================================================================
+
+TEMPLATE_HELP = """
+<div class="page-header"><h1><span>Help & Guide</span></h1></div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#8ff5ff">Quick Start</div>
+    <ol style="line-height:2;color:var(--text-muted);font-size:0.9rem">
+        <li><strong>Add a pallet:</strong> Go to Pallets → + Add Pallet → fill in name, price, supplier. Upload your CSV/XLSX file from the supplier.</li>
+        <li><strong>Set prices:</strong> Open the pallet → use Set Prices section → type prices or click Apply Multiplier (e.g. cost × 2.5).</li>
+        <li><strong>Match categories:</strong> Click Auto Categories → the app matches eBay categories automatically.</li>
+        <li><strong>Create drafts:</strong> Click Create Drafts → saves listings locally (NOT on eBay yet).</li>
+        <li><strong>Review:</strong> Go to Listings → check your drafts. Click on a product to edit title/description/price.</li>
+        <li><strong>Generate AI content:</strong> On product page, click Generate Title / Generate Description → AI creates eBay-optimized text.</li>
+        <li><strong>Publish:</strong> Go back to pallet → click Publish All → listings go LIVE on eBay (with confirmation).</li>
+        <li><strong>Ship orders:</strong> When something sells → go to Orders → Mark as Shipped with tracking number.</li>
+    </ol>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#beee00">Buttons Explained</div>
+    <div style="display:grid;grid-template-columns:150px 1fr;gap:8px;font-size:0.85rem;color:var(--text-muted)">
+        <div><span class="btn btn-purple btn-sm" style="font-size:0.7rem">Import CSV</span></div><div>Upload CSV/XLSX file with products from your supplier</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#f59e0b;color:#f59e0b">Create Drafts</span></div><div>Save listings locally — nothing goes to eBay yet</div>
+        <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Publish All</span></div><div>Send all drafts to eBay — listings go LIVE immediately!</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#a855f7;color:#a855f7">Auto Categories</span></div><div>Automatically match eBay categories for your products</div>
+        <div><span class="btn btn-cyan btn-sm" style="font-size:0.7rem">Scrape Images</span></div><div>Download product images from Amazon UK</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Title</span></div><div>AI creates an optimized eBay title (max 80 chars)</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Description</span></div><div>AI creates HTML description with features and bullet points</div>
+    </div>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#ff6b9b">Shipping</div>
+    <p style="color:var(--text-muted);font-size:0.85rem;line-height:1.8">
+        When a customer buys your product on eBay:<br>
+        1. You'll see the order in <strong>Orders</strong> tab with status "TO SHIP"<br>
+        2. Pack the item and take it to the post office (Royal Mail) or drop-off point (Evri/DPD)<br>
+        3. Get a tracking number from the courier<br>
+        4. Click <strong>Mark as Shipped</strong> and enter the tracking number<br>
+        5. eBay transfers money to your bank account (usually 2-3 days after delivery)<br><br>
+        <strong>Tip:</strong> You can buy cheaper shipping labels directly from eBay: My eBay → Sold → Print Shipping Label
+    </p>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#f59e0b">Tips for Better Sales</div>
+    <ul style="color:var(--text-muted);font-size:0.85rem;line-height:2">
+        <li>Use <strong>free postage</strong> (set shipping cost to £0) — eBay ranks free postage listings higher</li>
+        <li>Add <strong>8+ photos</strong> — listings with more photos get 30% more sales</li>
+        <li>Write detailed <strong>titles with keywords</strong> buyers search for</li>
+        <li>Set <strong>competitive prices</strong> — check what similar items sold for on eBay</li>
+        <li>Ship quickly — fast dispatch improves your seller rating</li>
+    </ul>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title">Need Help?</div>
+    <p style="color:var(--text-muted);font-size:0.85rem">Contact Adrian for technical support.</p>
+</div>
+"""
+
+@app.route('/help')
+def help_page():
+    return render_page(TEMPLATE_HELP, page_title='Help - eBay Hub UK', active_page='help')
+
+
+# ===================================================================
 # Category Matching
 # ===================================================================
 
@@ -3247,6 +3319,7 @@ def pallet_auto_categories(pallet_id):
     )
 
     matched = 0
+    gemini_fallback = 0
     for product in products:
         try:
             cats = ebay.get_suggested_categories(product['name'][:80])
@@ -3257,12 +3330,41 @@ def pallet_auto_categories(pallet_id):
                     (f"{best['category_id']}:{best['category_name']}", product['id'])
                 )
                 matched += 1
+                continue
         except Exception as e:
-            print(f"[Category] Error for product {product['id']}: {e}")
+            print(f"[Category] eBay API error for product {product['id']}: {e}")
+
+        # Gemini fallback — ask AI to suggest eBay category ID
+        try:
+            api_key = get_config('gemini_api_key', '')
+            if api_key:
+                import requests as _req
+                resp = _req.post(
+                    f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}',
+                    json={'contents': [{'parts': [{'text':
+                        f'What is the best eBay UK category for this product? '
+                        f'Return ONLY the eBay category ID number and name, format: "ID:Name"\n'
+                        f'Example: "175673:USB Hubs"\n\n'
+                        f'Product: {product["name"][:100]}'
+                    }]}]},
+                    timeout=10
+                )
+                result = resp.json()
+                if 'candidates' in result and result['candidates']:
+                    cat_text = result['candidates'][0]['content']['parts'][0]['text'].strip()
+                    if ':' in cat_text:
+                        execute_db("UPDATE products SET category = ? WHERE id = ?", (cat_text, product['id']))
+                        matched += 1
+                        gemini_fallback += 1
+        except Exception as e2:
+            print(f"[Category] Gemini fallback error: {e2}")
         import time
         time.sleep(0.5)  # Rate limit
 
-    flash(f'Matched categories for {matched}/{len(products)} products.', 'success')
+    msg = f'Matched categories for {matched}/{len(products)} products.'
+    if gemini_fallback:
+        msg += f' ({gemini_fallback} via AI fallback)'
+    flash(msg, 'success')
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
