@@ -1430,9 +1430,9 @@ textarea.form-control { resize: vertical; min-height: 80px; }
 /* Detail page layout */
 .detail-header {
     display: flex;
+    flex-direction: column;
     gap: 24px;
     margin-bottom: 24px;
-    flex-wrap: wrap;
 }
 .detail-image {
     width: 200px;
