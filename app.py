@@ -735,7 +735,9 @@ def product_update(product_id):
     except ValueError:
         weight_kg = length_cm = width_cm = height_cm = shipping_cost = 0.0
 
-    image_url = amazon_image(asin)
+    # Keep existing image — only set new one if product has no image yet
+    existing = query_db("SELECT image_url FROM products WHERE id = ?", (product_id,), one=True)
+    image_url = (existing['image_url'] if existing and existing['image_url'] else amazon_image(asin))
 
     execute_db(
         "UPDATE products SET name=?, asin=?, ean=?, quantity=?, condition=?, "
@@ -790,46 +792,64 @@ def list_on_ebay(product_id):
             '</div>'
         )
 
-    listing_id = execute_db(
-        "INSERT INTO ebay_listings (product_id, title, description, price_gbp, status) "
-        "VALUES (?, ?, ?, ?, 'draft')",
-        (product_id, title, description, price)
+    action = request.form.get('action', 'draft')
+
+    # Check if draft already exists — update instead of creating new
+    existing_draft = query_db(
+        "SELECT id FROM ebay_listings WHERE product_id = ? AND status = 'draft'",
+        (product_id,), one=True
     )
-
-    ebay = get_ebay_client(get_config)
-    if ebay.is_configured():
-        # Read default settings
-        shipping_key = get_config('default_shipping', 'royal_mail_2nd')
-        return_days = int(get_config('default_return_days', '30') or '30')
-
-        result = ebay.create_listing({
-            'title': title,
-            'description': description,
-            'price': price,
-            'condition': product['condition'],
-            'quantity': product['quantity'],
-            'category_id': '175673',
-            'ean': product['ean'],
-            'image_urls': [product['image_url']] if product['image_url'] else [],
-            'dispatch_days': 3,
-            'shipping_service': shipping_key,
-            'return_days': return_days,
-        })
-        if result and result.get('success'):
-            execute_db(
-                "UPDATE ebay_listings SET ebay_item_id=?, status='active' WHERE id=?",
-                (result['ebay_item_id'], listing_id)
-            )
-            execute_db(
-                "UPDATE products SET status='listed' WHERE id=?", (product_id,)
-            )
-            fees_msg = f' (fees: GBP {result["fees"]:.2f})' if result.get('fees') else ''
-            flash(f'Listed on eBay successfully!{fees_msg} Item ID: {result["ebay_item_id"]}', 'success')
-        else:
-            error = result.get('error', 'Unknown error') if result else 'API error'
-            flash(f'Draft saved. eBay API: {error}', 'warning')
+    if existing_draft:
+        execute_db(
+            "UPDATE ebay_listings SET title=?, description=?, price_gbp=? WHERE id=?",
+            (title, description, price, existing_draft['id'])
+        )
+        listing_id = existing_draft['id']
     else:
-        flash('Draft listing saved. Configure eBay API in Settings to publish.', 'info')
+        listing_id = execute_db(
+            "INSERT INTO ebay_listings (product_id, title, description, price_gbp, status) "
+            "VALUES (?, ?, ?, ?, 'draft')",
+            (product_id, title, description, price)
+        )
+
+    if action == 'draft':
+        flash('Draft saved! You can publish it later.', 'success')
+        return redirect(url_for('product_detail', product_id=product_id))
+
+    # Publish to eBay
+    ebay = get_ebay_client(get_config)
+    if not ebay.is_configured():
+        flash('Draft saved. Configure eBay API in Settings to publish.', 'info')
+        return redirect(url_for('product_detail', product_id=product_id))
+
+    shipping_key = product.get('shipping_method') or get_config('default_shipping', 'royal_mail_2nd')
+    shipping_cost = product.get('shipping_cost_gbp') or 0
+    return_days = int(get_config('default_return_days', '30') or '30')
+    cat = (product.get('category') or '175673').split(':')[0]
+
+    result = ebay.create_listing({
+        'title': title,
+        'description': description,
+        'price': price,
+        'condition': product['condition'],
+        'quantity': product['quantity'],
+        'category_id': cat,
+        'ean': product['ean'],
+        'image_urls': [product['image_url']] if product['image_url'] else [],
+        'dispatch_days': 3,
+        'shipping_service': shipping_key,
+        'shipping_cost': shipping_cost,
+        'return_days': return_days,
+    })
+    if result and result.get('success'):
+        execute_db("UPDATE ebay_listings SET ebay_item_id=?, status='active' WHERE id=?",
+                   (result['ebay_item_id'], listing_id))
+        execute_db("UPDATE products SET status='listed' WHERE id=?", (product_id,))
+        fees_msg = f' (fees: GBP {result["fees"]:.2f})' if result.get('fees') else ''
+        flash(f'Published on eBay!{fees_msg} Item ID: {result["ebay_item_id"]}', 'success')
+    else:
+        error = result.get('error', 'Unknown error') if result else 'API error'
+        flash(f'Draft saved. eBay error: {error}', 'warning')
 
     return redirect(url_for('product_detail', product_id=product_id))
 
@@ -1554,7 +1574,7 @@ document.querySelectorAll('form').forEach(function(f){
         var btn = f.querySelector('button[type="submit"]');
         var hasFile = f.querySelector('input[type="file"]');
         var action = f.action || '';
-        var isSlow = hasFile || action.includes('/scrape') || action.includes('/import') || action.includes('/add') || action.includes('/list-all') || action.includes('/list_ebay') || action.includes('/publish-all') || action.includes('/create-drafts');
+        var isSlow = hasFile || action.includes('/scrape') || action.includes('/import') || action.includes('/add') || action.includes('/list-all') || action.includes('/list_ebay') || action.includes('/publish-all') || action.includes('/create-drafts') || action.includes('/auto-categories') || action.includes('/mass-price');
         if(isSlow){
             overlay.style.display='flex';
             if(btn) btn.disabled=true;
@@ -2501,9 +2521,13 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
             <label class="form-label">Price (GBP)</label>
             <input type="number" step="0.01" name="price" class="form-control" value="{{ product.ebay_price_gbp }}">
         </div>
-        <div class="d-flex gap-8" style="margin-top: 16px;">
-            <button type="submit" class="btn btn-lime">
-                <span class="material-symbols-outlined">sell</span> List on eBay
+        <div class="d-flex gap-8" style="margin-top: 16px;flex-wrap:wrap">
+            <button type="submit" name="action" value="draft" class="btn btn-outline btn-sm" style="border-color:#f59e0b;color:#f59e0b">
+                <span class="material-symbols-outlined">save</span> Save Draft
+            </button>
+            <button type="submit" name="action" value="publish" class="btn btn-lime"
+                    onclick="return confirm('Publish to eBay? This listing will go LIVE immediately.')">
+                <span class="material-symbols-outlined">sell</span> Publish to eBay
             </button>
             <button type="button" class="btn btn-outline btn-sm" onclick="generateAI('title')" id="genTitleBtn">
                 <span class="material-symbols-outlined">auto_awesome</span> Generate Title
