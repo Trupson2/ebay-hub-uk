@@ -2502,12 +2502,12 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
     <form method="POST" action="/product/{{ product.id }}/list_ebay">
         <div class="form-group">
             <label class="form-label">Listing Title</label>
-            <input type="text" name="title" class="form-control" value="{{ product.name }}" maxlength="80">
+            <input type="text" name="title" class="form-control" value="{{ draft.title if draft else product.name }}" maxlength="80">
             <div class="form-hint">Max 80 characters. Make it descriptive for eBay search.</div>
         </div>
         <div class="form-group">
             <label class="form-label">Description</label>
-            <textarea name="description" id="descInput" class="form-control" rows="6" placeholder="Product description for eBay listing..." oninput="updatePreview()"></textarea>
+            <textarea name="description" id="descInput" class="form-control" rows="6" placeholder="Product description for eBay listing..." oninput="updatePreview()">{{ draft.description if draft else '' }}</textarea>
             <div style="margin-top:8px">
                 <button type="button" onclick="document.getElementById('descPreview').style.display=document.getElementById('descPreview').style.display==='none'?'block':'none'" class="btn btn-outline btn-sm" style="font-size:0.7rem">
                     <span class="material-symbols-outlined" style="font-size:0.85rem">visibility</span> Toggle Preview
@@ -2519,7 +2519,7 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         </div>
         <div class="form-group">
             <label class="form-label">Price (GBP)</label>
-            <input type="number" step="0.01" name="price" class="form-control" value="{{ product.ebay_price_gbp }}">
+            <input type="number" step="0.01" name="price" class="form-control" value="{{ draft.price_gbp if draft else product.ebay_price_gbp }}">
         </div>
         <div class="d-flex gap-8" style="margin-top: 16px;flex-wrap:wrap">
             <button type="submit" name="action" value="draft" class="btn btn-outline btn-sm" style="border-color:#f59e0b;color:#f59e0b">
@@ -2547,6 +2547,8 @@ function updatePreview() {
         document.getElementById('descPreview').style.display = 'block';
     }
 }
+// Auto-show preview if draft has description
+document.addEventListener('DOMContentLoaded', function() { updatePreview(); });
 function generateAI(type) {
     var btn = document.getElementById(type === 'title' ? 'genTitleBtn' : 'genDescBtn');
     var oldText = btn.innerHTML;
@@ -2662,6 +2664,12 @@ def product_detail(product_id):
         (product_id,)
     )
 
+    # Load existing draft for pre-filling the form
+    draft = query_db(
+        "SELECT * FROM ebay_listings WHERE product_id = ? AND status = 'draft' ORDER BY created_at DESC LIMIT 1",
+        (product_id,), one=True
+    )
+
     sales = query_db(
         "SELECT * FROM sales WHERE product_id = ? ORDER BY sold_at DESC",
         (product_id,)
@@ -2671,7 +2679,7 @@ def product_detail(product_id):
         TEMPLATE_PRODUCT_DETAIL_CONTENT,
         page_title=f'{product["name"]} - eBay Hub UK',
         active_page='pallets',
-        product=product, pallet=pallet, listings=listings, sales=sales
+        product=product, pallet=pallet, listings=listings, sales=sales, draft=draft
     )
 
 
