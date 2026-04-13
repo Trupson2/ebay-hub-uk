@@ -224,9 +224,7 @@ class EbayAPI:
         {product_listing_details}
         <ReturnPolicy>
             <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
-            <ReturnsWithinOption>Days_{return_days}</ReturnsWithinOption>
-            <RefundOption>MoneyBack</RefundOption>
-            <ShippingCostPaidByOption>Buyer</ShippingCostPaidByOption>
+            <ReturnsWithinOption>Days_30</ReturnsWithinOption>
         </ReturnPolicy>
         <ShippingDetails>
             <ShippingType>Flat</ShippingType>
