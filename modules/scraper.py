@@ -163,53 +163,78 @@ def _extract_bullet_points(soup):
     return bullets
 
 
-def _extract_all_images(soup):
-    """Extract all product images (up to 8) from Amazon page."""
+def _extract_all_images(soup, page_text='', asin=''):
+    """Extract all product images (up to 8) from Amazon page.
+    Uses same proven logic as Akces Hub scraper."""
     images = []
 
-    # Method 1: data-a-dynamic-image JSON on the landing image
-    img_el = soup.select_one('#landingImage') or soup.select_one('#imgBlkFront')
-    if img_el:
-        dyn = img_el.get('data-a-dynamic-image', '')
-        if dyn:
+    # Method 1: colorImages JSON (best method — gets unique images)
+    color_match = re.search(r"'colorImages'\s*:\s*\{[^}]*'initial'\s*:\s*(\[[^\]]+\])", page_text)
+    if not color_match:
+        color_match = re.search(r'"colorImages"\s*:\s*\{[^}]*"initial"\s*:\s*(\[[^\]]+\])', page_text)
+
+    if color_match:
+        try:
+            gallery_str = color_match.group(1).replace("'", '"')
+            gallery_data = json.loads(gallery_str)
+            for item in gallery_data:
+                if isinstance(item, dict):
+                    img_url = item.get('hiRes') or item.get('large') or (item.get('main', {}) or {}).get('url')
+                    if img_url and '/I/' in img_url:
+                        clean_url = re.sub(r'\._[A-Z0-9_,]+_\.', '._AC_SL1500_.', img_url)
+                        if clean_url not in images:
+                            images.append(clean_url)
+        except:
+            pass
+
+    # Method 2: imageGalleryData
+    if len(images) < 4:
+        gallery_match = re.search(r'"imageGalleryData"\s*:\s*(\[[^\]]+\])', page_text)
+        if gallery_match:
             try:
-                img_dict = json.loads(dyn)
-                # Keys are URLs, values are [width, height] — sort by resolution desc
-                sorted_urls = sorted(img_dict.keys(),
-                                     key=lambda u: img_dict[u][0] * img_dict[u][1] if isinstance(img_dict[u], list) else 0,
-                                     reverse=True)
-                for url in sorted_urls:
-                    if url and 'placeholder' not in url.lower() and url not in images:
-                        images.append(url)
-            except (json.JSONDecodeError, TypeError):
+                urls = re.findall(r'"mainUrl"\s*:\s*"([^"]+)"', gallery_match.group(1))
+                for url in urls:
+                    if '/I/' in url:
+                        clean_url = re.sub(r'\._[A-Z0-9_,]+_\.', '._AC_SL1500_.', url)
+                        if clean_url not in images:
+                            images.append(clean_url)
+            except:
                 pass
 
-    # Method 2: Image gallery thumbnails (altImages)
-    alt_div = soup.select_one('#altImages') or soup.select_one('#imageBlock')
-    if alt_div:
-        for thumb in alt_div.select('img'):
-            src = thumb.get('src', '')
-            if not src or 'sprite' in src or 'grey-pixel' in src or 'play-button' in src:
-                continue
-            # Convert thumbnail URL to large image URL
-            # Thumbnails: ._SL75_ or ._SS40_ — replace with ._SL1500_
-            large = re.sub(r'\._[A-Z]{2}\d+_', '._SL1500_', src)
-            large = re.sub(r'\._[A-Z]{2}\d+,\d+_', '._SL1500_', large)
-            if large not in images and 'placeholder' not in large.lower():
-                images.append(large)
+    # Method 3: All hiRes/large URLs from entire page
+    if len(images) < 4:
+        all_hires = re.findall(r'"hiRes"\s*:\s*"(https://[^"]+)"', page_text)
+        all_large = re.findall(r'"large"\s*:\s*"(https://[^"]+)"', page_text)
+        for img_list in [all_hires, all_large]:
+            for img in img_list:
+                if '/I/' in img and not any(x in img.lower() for x in ['icon', 'button', 'sprite', 'transparent']):
+                    clean_url = re.sub(r'\._[A-Z0-9_,]+_\.', '._AC_SL1500_.', img)
+                    if clean_url not in images:
+                        images.append(clean_url)
+                if len(images) >= 8:
+                    break
 
-    # Method 3: Script-based image data (imageGalleryData)
-    for script in soup.select('script[type="text/javascript"]'):
-        text = script.string or ''
-        if 'imageGalleryData' in text or "'colorImages'" in text or '"colorImages"' in text:
-            # Find all high-res image URLs in the script block
-            url_matches = re.findall(r'"(https://m\.media-amazon\.com/images/I/[^"]+\.jpg)"', text)
-            for url in url_matches:
-                if '_SL1500_' in url or '_SL1200_' in url or '_AC_' in url:
-                    if url not in images:
-                        images.append(url)
+    # Method 4: data-old-hires attributes
+    if len(images) < 4:
+        hires_attrs = re.findall(r'data-old-hires="([^"]+)"', page_text)
+        for img in hires_attrs:
+            if '/I/' in img:
+                clean_url = re.sub(r'\._[A-Z0-9_,]+_\.', '._AC_SL1500_.', img)
+                if clean_url not in images:
+                    images.append(clean_url)
 
-    # Deduplicate and limit to 8
+    # Method 5: landingImageUrl
+    if len(images) < 4:
+        landing = re.search(r'"landingImageUrl"\s*:\s*"([^"]+)"', page_text)
+        if landing:
+            clean_url = re.sub(r'\._[A-Z0-9_,]+_\.', '._AC_SL1500_.', landing.group(1))
+            if clean_url not in images:
+                images.append(clean_url)
+
+    # Fallback
+    if not images and asin:
+        images = [f'https://m.media-amazon.com/images/I/{asin}._AC_SL1500_.jpg']
+
     return images[:8]
 
 
@@ -343,7 +368,7 @@ def scrape_amazon_product(asin):
             price = _extract_price(soup)
             bullet_points = _extract_bullet_points(soup)
             category = _extract_category(soup)
-            all_images = _extract_all_images(soup)
+            all_images = _extract_all_images(soup, page_text=resp.text, asin=asin)
             item_specifics = _extract_item_specifics(soup)
 
             # Ensure main image is first in all_images
