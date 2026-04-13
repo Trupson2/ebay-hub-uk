@@ -499,6 +499,105 @@ def pallet_scrape(pallet_id):
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
+@app.route('/pallet/<int:pallet_id>/list-all', methods=['POST'])
+def pallet_list_all_ebay(pallet_id):
+    """Mass-list all warehouse products on eBay."""
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    products = query_db(
+        "SELECT * FROM products WHERE pallet_id = ? AND status = 'warehouse' AND name != ''",
+        (pallet_id,)
+    )
+
+    if not products:
+        flash('No eligible products to list (need warehouse status and a name).', 'info')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    ebay = get_ebay_client(get_config)
+    if not ebay.is_configured():
+        flash('eBay API not configured. Go to Settings and enter your credentials.', 'error')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    # Read default settings
+    shipping_key = get_config('default_shipping', 'royal_mail_2nd')
+    return_days = int(get_config('default_return_days', '30') or '30')
+
+    listed = 0
+    failed = 0
+    errors = []
+
+    for product in products:
+        title = product['name'][:80]
+        price = product['ebay_price_gbp'] or 0.0
+
+        if price <= 0:
+            failed += 1
+            errors.append(f"{title[:40]}: no price set")
+            continue
+
+        # Generate HTML description
+        description = (
+            '<div style="font-family:Arial,sans-serif">'
+            f'<h2>{title}</h2>'
+            f'<p>{product["name"]}</p>'
+            f'<p>Condition: {product["condition"].replace("_", " ").title()}</p>'
+            '<p>Fast dispatch from UK warehouse.</p>'
+            '</div>'
+        )
+
+        image_urls = [product['image_url']] if product.get('image_url') else []
+
+        try:
+            result = ebay.create_listing({
+                'title': title,
+                'description': description,
+                'price': price,
+                'condition': product['condition'],
+                'quantity': product['quantity'],
+                'category_id': '175673',
+                'image_urls': image_urls,
+                'ean': product.get('ean', ''),
+                'dispatch_days': 3,
+                'shipping_service': shipping_key,
+                'return_days': return_days,
+            })
+
+            if result and result.get('success'):
+                # Insert listing record
+                listing_id = execute_db(
+                    "INSERT INTO ebay_listings (product_id, ebay_item_id, title, description, price_gbp, status) "
+                    "VALUES (?, ?, ?, ?, ?, 'active')",
+                    (product['id'], result['ebay_item_id'], title, description, price)
+                )
+                # Update product status
+                execute_db(
+                    "UPDATE products SET status='listed' WHERE id=?",
+                    (product['id'],)
+                )
+                listed += 1
+            else:
+                error_msg = result.get('error', 'Unknown error') if result else 'API error'
+                failed += 1
+                errors.append(f"{title[:40]}: {error_msg[:80]}")
+        except Exception as e:
+            failed += 1
+            errors.append(f"{title[:40]}: {str(e)[:80]}")
+            print(f"[eBay Mass List] Exception for product {product['id']}: {e}")
+
+    # Build flash message
+    msg = f'eBay listing complete: {listed} listed, {failed} failed out of {len(products)} products.'
+    if errors:
+        msg += ' Errors: ' + '; '.join(errors[:5])
+        if len(errors) > 5:
+            msg += f' (+{len(errors) - 5} more)'
+
+    flash(msg, 'success' if failed == 0 else 'warning')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
 @app.route('/pallet/<int:pallet_id>/add_product', methods=['POST'])
 def add_product(pallet_id):
     name = request.form.get('name', '').strip()
@@ -595,7 +694,7 @@ def list_on_ebay(product_id):
         flash('Product not found.', 'error')
         return redirect(url_for('pallets_list'))
 
-    title = request.form.get('title', product['name'])
+    title = request.form.get('title', product['name'])[:80]
     description = request.form.get('description', '')
     price = request.form.get('price', str(product['ebay_price_gbp']))
 
@@ -603,6 +702,17 @@ def list_on_ebay(product_id):
         price = float(price)
     except ValueError:
         price = product['ebay_price_gbp']
+
+    # Generate HTML description if user left it empty
+    if not description.strip():
+        description = (
+            '<div style="font-family:Arial,sans-serif">'
+            f'<h2>{title}</h2>'
+            f'<p>{product["name"]}</p>'
+            f'<p>Condition: {product["condition"].replace("_", " ").title()}</p>'
+            '<p>Fast dispatch from UK warehouse.</p>'
+            '</div>'
+        )
 
     listing_id = execute_db(
         "INSERT INTO ebay_listings (product_id, title, description, price_gbp, status) "
@@ -612,14 +722,22 @@ def list_on_ebay(product_id):
 
     ebay = get_ebay_client(get_config)
     if ebay.is_configured():
+        # Read default settings
+        shipping_key = get_config('default_shipping', 'royal_mail_2nd')
+        return_days = int(get_config('default_return_days', '30') or '30')
+
         result = ebay.create_listing({
             'title': title,
             'description': description,
             'price': price,
             'condition': product['condition'],
             'quantity': product['quantity'],
+            'category_id': '175673',
             'ean': product['ean'],
-            'image_urls': [product['image_url']] if product['image_url'] else []
+            'image_urls': [product['image_url']] if product['image_url'] else [],
+            'dispatch_days': 3,
+            'shipping_service': shipping_key,
+            'return_days': return_days,
         })
         if result and result.get('success'):
             execute_db(
@@ -629,7 +747,8 @@ def list_on_ebay(product_id):
             execute_db(
                 "UPDATE products SET status='listed' WHERE id=?", (product_id,)
             )
-            flash('Listed on eBay successfully!', 'success')
+            fees_msg = f' (fees: GBP {result["fees"]:.2f})' if result.get('fees') else ''
+            flash(f'Listed on eBay successfully!{fees_msg} Item ID: {result["ebay_item_id"]}', 'success')
         else:
             error = result.get('error', 'Unknown error') if result else 'API error'
             flash(f'Draft saved. eBay API: {error}', 'warning')
@@ -1350,7 +1469,7 @@ document.querySelectorAll('form').forEach(function(f){
         var overlay = document.getElementById('loadingOverlay');
         var btn = f.querySelector('button[type="submit"]');
         var hasFile = f.querySelector('input[type="file"]');
-        var isScrape = f.action && (f.action.includes('/scrape') || f.action.includes('/import') || f.action.includes('/add'));
+        var isScrape = f.action && (f.action.includes('/scrape') || f.action.includes('/import') || f.action.includes('/add') || f.action.includes('/list-all') || f.action.includes('/list_ebay'));
         if(isScrape || hasFile){
             overlay.style.display='flex';
             if(btn) btn.disabled=true;
@@ -1628,6 +1747,12 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
         <a href="/pallet/{{ pallet.id }}/import" class="btn btn-purple btn-sm">
             <span class="material-symbols-outlined">upload_file</span> Import CSV
         </a>
+        <form method="POST" action="/pallet/{{ pallet.id }}/list-all" class="inline-form"
+              onsubmit="document.getElementById('loadingOverlay').style.display='flex';document.getElementById('loadingText').textContent='Listing on eBay...'">
+            <button type="submit" class="btn btn-lime btn-sm">
+                <span class="material-symbols-outlined">sell</span> List All on eBay
+            </button>
+        </form>
         <form method="POST" action="/pallet/{{ pallet.id }}/scrape" class="inline-form">
             <button type="submit" class="btn btn-cyan btn-sm">
                 <span class="material-symbols-outlined">photo_camera</span> Scrape Images
