@@ -2444,7 +2444,7 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         <!-- Image Carousel -->
         <div style="text-align:center;">
             <img id="mainProductImage" src="{{ product.image_url or '' }}" alt="{{ product.name }}"
-                 class="detail-image" style="max-width:300px;max-height:300px;object-fit:contain;border-radius:8px;background:rgba(0,0,0,0.2);cursor:zoom-in"
+                 class="detail-image" style="max-width:100%;max-height:500px;object-fit:contain;border-radius:12px;background:rgba(255,255,255,0.95);padding:16px;cursor:zoom-in"
                  onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><rect fill=%22%2312121a%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%236a6a80%22 font-size=%2214%22>No Image</text></svg>'"
                  onclick="window.open(this.src,'_blank')">
             <div style="display:flex;gap:6px;margin-top:8px;justify-content:center;flex-wrap:wrap" id="thumbStrip">
@@ -2476,6 +2476,8 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         </script>
         {% elif product.image_url %}
         <img src="{{ product.image_url }}" alt="{{ product.name }}" class="detail-image"
+             style="max-width:100%;max-height:500px;object-fit:contain;border-radius:12px;background:rgba(255,255,255,0.95);padding:16px;cursor:zoom-in"
+             onclick="window.open(this.src,'_blank')"
              onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><rect fill=%22%2312121a%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%236a6a80%22 font-size=%2214%22>No Image</text></svg>'">
         {% endif %}
     </div>
