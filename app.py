@@ -2441,44 +2441,108 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
     <div style="flex-shrink:0;">
         {% set all_images = product.images|default('', true) %}
         {% if all_images and all_images != '[]' and all_images != '' %}
-        <!-- Image Carousel -->
-        <div style="text-align:center;">
-            <img id="mainProductImage" src="{{ product.image_url or '' }}" alt="{{ product.name }}"
-                 class="detail-image" style="width:100%;height:auto;min-height:300px;max-height:600px;object-fit:contain;border-radius:12px;background:rgba(255,255,255,0.95);cursor:zoom-in"
-                 onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><rect fill=%22%2312121a%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%236a6a80%22 font-size=%2214%22>No Image</text></svg>'"
-                 onclick="window.open(this.src,'_blank')">
-            <div style="display:flex;gap:6px;margin-top:8px;justify-content:center;flex-wrap:wrap" id="thumbStrip">
-            </div>
+        <!-- 3D Image Carousel -->
+        <style>
+        .carousel-3d{position:relative;height:420px;display:flex;align-items:center;justify-content:center;perspective:900px;overflow:hidden;margin:0 -16px}
+        .carousel-3d .c3d-slide{position:absolute;transition:all 0.5s ease;border-radius:12px;overflow:hidden;background:rgba(255,255,255,0.95);display:flex;align-items:center;justify-content:center}
+        .carousel-3d .c3d-slide img{max-width:100%;max-height:100%;object-fit:contain}
+        .carousel-3d .c3d-center{width:320px;height:380px;z-index:10;transform:translateX(0) scale(1);box-shadow:0 20px 60px rgba(0,0,0,0.5);cursor:zoom-in}
+        .carousel-3d .c3d-left{width:200px;height:260px;z-index:5;transform:translateX(-220px) rotateY(25deg) scale(0.85);opacity:0.7;filter:brightness(0.7)}
+        .carousel-3d .c3d-right{width:200px;height:260px;z-index:5;transform:translateX(220px) rotateY(-25deg) scale(0.85);opacity:0.7;filter:brightness(0.7)}
+        .carousel-3d .c3d-hidden{width:160px;height:200px;z-index:1;opacity:0;transform:scale(0.5)}
+        .c3d-arrow{position:absolute;top:50%;transform:translateY(-50%);z-index:20;width:44px;height:44px;border-radius:50%;background:rgba(143,245,255,0.15);border:1px solid rgba(143,245,255,0.3);color:#8ff5ff;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:1.4rem;transition:all 0.2s;backdrop-filter:blur(8px)}
+        .c3d-arrow:hover{background:rgba(143,245,255,0.3);box-shadow:0 0 20px rgba(143,245,255,0.3)}
+        .c3d-arrow.left{left:8px}
+        .c3d-arrow.right{right:8px}
+        .c3d-dots{display:flex;gap:6px;justify-content:center;margin-top:12px}
+        .c3d-dot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,0.15);cursor:pointer;transition:all 0.3s}
+        .c3d-dot.active{background:#8ff5ff;box-shadow:0 0 8px rgba(143,245,255,0.5)}
+        @media(max-width:600px){.carousel-3d{height:320px}.carousel-3d .c3d-center{width:240px;height:280px}.carousel-3d .c3d-left,.carousel-3d .c3d-right{width:140px;height:180px;transform:translateX(-160px) rotateY(25deg) scale(0.8)}.carousel-3d .c3d-right{transform:translateX(160px) rotateY(-25deg) scale(0.8)}}
+        </style>
+        <div class="carousel-3d" id="carousel3d">
+            <div class="c3d-arrow left" onclick="c3dNav(-1)"><span class="material-symbols-outlined">chevron_left</span></div>
+            <div class="c3d-arrow right" onclick="c3dNav(1)"><span class="material-symbols-outlined">chevron_right</span></div>
         </div>
+        <div class="c3d-dots" id="c3dDots"></div>
         <script>
         (function(){
-            try {
-                var imgs = JSON.parse({{ all_images|tojson }});
-                var main = document.getElementById('mainProductImage');
-                var strip = document.getElementById('thumbStrip');
-                if (imgs && imgs.length > 0) {
-                    if (main && !main.src) main.src = imgs[0];
-                    imgs.forEach(function(url, i){
-                        var t = document.createElement('img');
-                        t.src = url;
-                        t.style.cssText = 'width:48px;height:48px;object-fit:contain;border-radius:4px;cursor:pointer;border:2px solid ' + (i===0?'#8ff5ff':'transparent') + ';background:rgba(0,0,0,0.3);';
-                        t.onerror = function(){ this.style.display='none'; };
-                        t.onclick = function(){
-                            main.src = url;
-                            strip.querySelectorAll('img').forEach(function(el){ el.style.borderColor='transparent'; });
-                            t.style.borderColor='#8ff5ff';
-                        };
-                        strip.appendChild(t);
-                    });
-                }
-            } catch(e){}
+            var imgs = [];
+            try { imgs = JSON.parse({{ all_images|tojson }}); } catch(e){}
+            if (!imgs || imgs.length === 0) imgs = ['{{ product.image_url or "" }}'];
+            imgs = imgs.filter(function(u){ return u && u.length > 5; });
+            if (imgs.length === 0) return;
+
+            var idx = 0;
+            var container = document.getElementById('carousel3d');
+            var dots = document.getElementById('c3dDots');
+
+            function render() {
+                // Clear slides
+                var old = container.querySelectorAll('.c3d-slide');
+                old.forEach(function(el){ el.remove(); });
+
+                var positions = ['c3d-hidden','c3d-left','c3d-center','c3d-right','c3d-hidden'];
+                var offsets = [-2,-1,0,1,2];
+
+                offsets.forEach(function(off, pi){
+                    var i = (idx + off + imgs.length) % imgs.length;
+                    var slide = document.createElement('div');
+                    slide.className = 'c3d-slide ' + positions[pi];
+                    var img = document.createElement('img');
+                    img.src = imgs[i];
+                    img.onerror = function(){ this.style.display='none'; };
+                    if (positions[pi] === 'c3d-center') {
+                        img.onclick = function(){ window.open(imgs[idx], '_blank'); };
+                    } else if (positions[pi] === 'c3d-left') {
+                        slide.style.cursor = 'pointer';
+                        slide.onclick = function(){ c3dNav(-1); };
+                    } else if (positions[pi] === 'c3d-right') {
+                        slide.style.cursor = 'pointer';
+                        slide.onclick = function(){ c3dNav(1); };
+                    }
+                    slide.appendChild(img);
+                    container.appendChild(slide);
+                });
+
+                // Update dots
+                dots.innerHTML = '';
+                imgs.forEach(function(_, i){
+                    var d = document.createElement('div');
+                    d.className = 'c3d-dot' + (i === idx ? ' active' : '');
+                    d.onclick = function(){ idx = i; render(); };
+                    dots.appendChild(d);
+                });
+            }
+
+            window.c3dNav = function(dir) {
+                idx = (idx + dir + imgs.length) % imgs.length;
+                render();
+            };
+
+            // Swipe support
+            var startX = 0;
+            container.addEventListener('touchstart', function(e){ startX = e.touches[0].clientX; });
+            container.addEventListener('touchend', function(e){
+                var diff = e.changedTouches[0].clientX - startX;
+                if (Math.abs(diff) > 50) c3dNav(diff > 0 ? -1 : 1);
+            });
+
+            // Keyboard
+            document.addEventListener('keydown', function(e){
+                if (e.key === 'ArrowLeft') c3dNav(-1);
+                if (e.key === 'ArrowRight') c3dNav(1);
+            });
+
+            render();
         })();
         </script>
         {% elif product.image_url %}
-        <img src="{{ product.image_url }}" alt="{{ product.name }}" class="detail-image"
-             style="max-width:100%;max-height:500px;object-fit:contain;border-radius:12px;background:rgba(255,255,255,0.95);padding:16px;cursor:zoom-in"
-             onclick="window.open(this.src,'_blank')"
-             onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><rect fill=%22%2312121a%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%236a6a80%22 font-size=%2214%22>No Image</text></svg>'">
+        <div style="text-align:center">
+            <img src="{{ product.image_url }}" alt="{{ product.name }}"
+                 style="width:100%;max-height:500px;object-fit:contain;border-radius:12px;background:rgba(255,255,255,0.95);cursor:zoom-in"
+                 onclick="window.open(this.src,'_blank')"
+                 onerror="this.style.display='none'">
+        </div>
         {% endif %}
     </div>
     <div class="detail-info">
