@@ -523,9 +523,9 @@ def pallet_mass_price(pallet_id):
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
-@app.route('/pallet/<int:pallet_id>/list-all', methods=['POST'])
-def pallet_list_all_ebay(pallet_id):
-    """Mass-list all warehouse products on eBay."""
+@app.route('/pallet/<int:pallet_id>/create-drafts', methods=['POST'])
+def pallet_create_drafts(pallet_id):
+    """Create draft listings for all warehouse products (saved locally, NOT sent to eBay)."""
     pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
     if not pallet:
         flash('Pallet not found.', 'error')
@@ -537,32 +537,21 @@ def pallet_list_all_ebay(pallet_id):
     )
 
     if not products:
-        flash('No eligible products to list (need warehouse status and a name).', 'info')
+        flash('No eligible products (need warehouse status and a name).', 'info')
         return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
-    ebay = get_ebay_client(get_config)
-    if not ebay.is_configured():
-        flash('eBay API not configured. Go to Settings and enter your credentials.', 'error')
-        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
-
-    # Read default settings
-    shipping_key = get_config('default_shipping', 'royal_mail_2nd')
-    return_days = int(get_config('default_return_days', '30') or '30')
-
-    listed = 0
-    failed = 0
-    errors = []
-
+    created = 0
+    skipped = 0
     for product in products:
-        title = product['name'][:80]
-        price = product['ebay_price_gbp'] or 0.0
-
-        if price <= 0:
-            failed += 1
-            errors.append(f"{title[:40]}: no price set")
+        # Skip if draft already exists
+        existing = query_db("SELECT id FROM ebay_listings WHERE product_id = ? AND status = 'draft'",
+                           (product['id'],), one=True)
+        if existing:
+            skipped += 1
             continue
 
-        # Generate HTML description
+        title = product['name'][:80]
+        price = product['ebay_price_gbp'] or 0.0
         description = (
             '<div style="font-family:Arial,sans-serif">'
             f'<h2>{title}</h2>'
@@ -571,19 +560,70 @@ def pallet_list_all_ebay(pallet_id):
             '<p>Fast dispatch from UK warehouse.</p>'
             '</div>'
         )
+        execute_db(
+            "INSERT INTO ebay_listings (product_id, title, description, price_gbp, status) "
+            "VALUES (?, ?, ?, ?, 'draft')",
+            (product['id'], title, description, price)
+        )
+        created += 1
 
-        image_urls = [product['image_url']] if product.get('image_url') else []
+    msg = f'Created {created} drafts.'
+    if skipped:
+        msg += f' ({skipped} already had drafts)'
+    msg += ' Go to Listings to review and publish.'
+    flash(msg, 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
+
+@app.route('/pallet/<int:pallet_id>/publish-all', methods=['POST'])
+def pallet_publish_all(pallet_id):
+    """Publish all draft listings to eBay."""
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    ebay = get_ebay_client(get_config)
+    if not ebay.is_configured():
+        flash('eBay API not configured. Go to Settings.', 'error')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    drafts = query_db(
+        """SELECT l.*, p.image_url, p.condition, p.quantity, p.ean, p.id as prod_id
+           FROM ebay_listings l
+           JOIN products p ON p.id = l.product_id
+           WHERE p.pallet_id = ? AND l.status = 'draft'""",
+        (pallet_id,)
+    )
+
+    if not drafts:
+        flash('No drafts to publish.', 'info')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    shipping_key = get_config('default_shipping', 'royal_mail_2nd')
+    return_days = int(get_config('default_return_days', '30') or '30')
+
+    published = 0
+    failed = 0
+    errors = []
+
+    for draft in drafts:
+        if (draft['price_gbp'] or 0) <= 0:
+            failed += 1
+            errors.append(f"{draft['title'][:40]}: no price")
+            continue
+
+        image_urls = [draft['image_url']] if draft.get('image_url') else []
         try:
             result = ebay.create_listing({
-                'title': title,
-                'description': description,
-                'price': price,
-                'condition': product['condition'],
-                'quantity': product['quantity'],
+                'title': draft['title'],
+                'description': draft['description'],
+                'price': draft['price_gbp'],
+                'condition': draft['condition'],
+                'quantity': draft['quantity'],
                 'category_id': '175673',
                 'image_urls': image_urls,
-                'ean': product.get('ean', ''),
+                'ean': draft.get('ean', ''),
                 'dispatch_days': 3,
                 'shipping_service': shipping_key,
                 'return_days': return_days,
@@ -593,31 +633,24 @@ def pallet_list_all_ebay(pallet_id):
                 # Insert listing record
                 listing_id = execute_db(
                     "INSERT INTO ebay_listings (product_id, ebay_item_id, title, description, price_gbp, status) "
-                    "VALUES (?, ?, ?, ?, ?, 'active')",
-                    (product['id'], result['ebay_item_id'], title, description, price)
-                )
-                # Update product status
+            if result and result.get('success'):
                 execute_db(
-                    "UPDATE products SET status='listed' WHERE id=?",
-                    (product['id'],)
+                    "UPDATE ebay_listings SET ebay_item_id=?, status='active' WHERE id=?",
+                    (result['ebay_item_id'], draft['id'])
                 )
-                listed += 1
+                execute_db("UPDATE products SET status='listed' WHERE id=?", (draft['prod_id'],))
+                published += 1
             else:
                 error_msg = result.get('error', 'Unknown error') if result else 'API error'
                 failed += 1
-                errors.append(f"{title[:40]}: {error_msg[:80]}")
+                errors.append(f"{draft['title'][:40]}: {error_msg[:80]}")
         except Exception as e:
             failed += 1
-            errors.append(f"{title[:40]}: {str(e)[:80]}")
-            print(f"[eBay Mass List] Exception for product {product['id']}: {e}")
+            errors.append(f"{draft['title'][:40]}: {str(e)[:80]}")
 
-    # Build flash message
-    msg = f'eBay listing complete: {listed} listed, {failed} failed out of {len(products)} products.'
+    msg = f'Published {published} listings, {failed} failed.'
     if errors:
         msg += ' Errors: ' + '; '.join(errors[:5])
-        if len(errors) > 5:
-            msg += f' (+{len(errors) - 5} more)'
-
     flash(msg, 'success' if failed == 0 else 'warning')
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
@@ -1771,10 +1804,15 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
         <a href="/pallet/{{ pallet.id }}/import" class="btn btn-purple btn-sm">
             <span class="material-symbols-outlined">upload_file</span> Import CSV
         </a>
-        <form method="POST" action="/pallet/{{ pallet.id }}/list-all" class="inline-form"
-              onsubmit="document.getElementById('loadingOverlay').style.display='flex';document.getElementById('loadingText').textContent='Listing on eBay...'">
+        <form method="POST" action="/pallet/{{ pallet.id }}/create-drafts" class="inline-form">
+            <button type="submit" class="btn btn-outline btn-sm" style="border-color:rgba(245,158,11,0.3);color:#f59e0b">
+                <span class="material-symbols-outlined">edit_note</span> Create Drafts
+            </button>
+        </form>
+        <form method="POST" action="/pallet/{{ pallet.id }}/publish-all" class="inline-form"
+              onsubmit="return confirm('Publish all drafts to eBay? Listings go LIVE immediately.') && (document.getElementById('loadingOverlay').style.display='flex',document.getElementById('loadingText').textContent='Publishing to eBay...',true)">
             <button type="submit" class="btn btn-lime btn-sm">
-                <span class="material-symbols-outlined">sell</span> List All on eBay
+                <span class="material-symbols-outlined">sell</span> Publish All
             </button>
         </form>
         <form method="POST" action="/pallet/{{ pallet.id }}/scrape" class="inline-form">
