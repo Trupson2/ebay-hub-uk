@@ -34,8 +34,17 @@ def create_backup():
         backup_name = f"ebay_hub_backup_{timestamp}.db"
         backup_path = BACKUP_DIR / backup_name
 
-        # Use SQLite backup API (safe, even during writes)
+        # Check source DB size
+        db_size = DB_PATH.stat().st_size
+        print(f"[BACKUP] Source DB: {DB_PATH} ({db_size / 1024:.1f} KB)")
+        if db_size < 1024:
+            print(f"[BACKUP] WARNING: Source DB is very small ({db_size} bytes) — may be empty!")
+
+        # Checkpoint WAL to ensure all data is in main DB file
         source = sqlite3.connect(str(DB_PATH))
+        source.execute('PRAGMA wal_checkpoint(FULL)')
+
+        # Use SQLite backup API (safe, even during writes)
         dest = sqlite3.connect(str(backup_path))
         with dest:
             source.backup(dest)
@@ -104,9 +113,20 @@ def restore_backup(backup_name):
         # Create safety backup of current DB
         create_backup()
 
+        # Close all connections to current DB
+        from .database import close_db
+        close_db()
+
+        # Remove WAL/SHM files (stale after replace)
+        for suffix in ['-wal', '-shm']:
+            wal_path = Path(str(DB_PATH) + suffix)
+            if wal_path.exists():
+                wal_path.unlink()
+
         # Replace current DB
         import shutil
         shutil.copy2(str(backup_path), str(DB_PATH))
+        print(f"[BACKUP] Restored: {backup_name} ({backup_path.stat().st_size / 1024:.1f} KB)")
         return True, f"Restored from {backup_name}"
 
     except Exception as e:
