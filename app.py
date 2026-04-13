@@ -2443,13 +2443,13 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         {% if all_images and all_images != '[]' and all_images != '' %}
         <!-- 3D Image Carousel -->
         <style>
-        .carousel-3d{position:relative;height:420px;display:flex;align-items:center;justify-content:center;perspective:900px;overflow:hidden;margin:0 -16px}
-        .carousel-3d .c3d-slide{position:absolute;transition:all 0.5s ease;border-radius:12px;overflow:hidden;background:rgba(255,255,255,0.95);display:flex;align-items:center;justify-content:center}
+        .carousel-3d{position:relative;height:520px;display:flex;align-items:center;justify-content:center;perspective:1200px;overflow:visible;margin:0 auto;max-width:900px}
+        .carousel-3d .c3d-slide{position:absolute;transition:all 0.5s ease;border-radius:14px;overflow:hidden;background:rgba(255,255,255,0.97);display:flex;align-items:center;justify-content:center;padding:12px}
         .carousel-3d .c3d-slide img{max-width:100%;max-height:100%;object-fit:contain}
-        .carousel-3d .c3d-center{width:320px;height:380px;z-index:10;transform:translateX(0) scale(1);box-shadow:0 20px 60px rgba(0,0,0,0.5);cursor:zoom-in}
-        .carousel-3d .c3d-left{width:200px;height:260px;z-index:5;transform:translateX(-220px) rotateY(25deg) scale(0.85);opacity:0.7;filter:brightness(0.7)}
-        .carousel-3d .c3d-right{width:200px;height:260px;z-index:5;transform:translateX(220px) rotateY(-25deg) scale(0.85);opacity:0.7;filter:brightness(0.7)}
-        .carousel-3d .c3d-hidden{width:160px;height:200px;z-index:1;opacity:0;transform:scale(0.5)}
+        .carousel-3d .c3d-center{width:420px;height:480px;z-index:10;transform:translateX(0) scale(1);box-shadow:0 25px 70px rgba(0,0,0,0.5);cursor:zoom-in}
+        .carousel-3d .c3d-left{width:250px;height:320px;z-index:5;transform:translateX(-280px) rotateY(30deg) scale(0.8);opacity:0.6;filter:brightness(0.6);cursor:pointer}
+        .carousel-3d .c3d-right{width:250px;height:320px;z-index:5;transform:translateX(280px) rotateY(-30deg) scale(0.8);opacity:0.6;filter:brightness(0.6);cursor:pointer}
+        .carousel-3d .c3d-hidden{width:180px;height:220px;z-index:1;opacity:0;transform:scale(0.3)}
         .c3d-arrow{position:absolute;top:50%;transform:translateY(-50%);z-index:20;width:44px;height:44px;border-radius:50%;background:rgba(143,245,255,0.15);border:1px solid rgba(143,245,255,0.3);color:#8ff5ff;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:1.4rem;transition:all 0.2s;backdrop-filter:blur(8px)}
         .c3d-arrow:hover{background:rgba(143,245,255,0.3);box-shadow:0 0 20px rgba(143,245,255,0.3)}
         .c3d-arrow.left{left:8px}
