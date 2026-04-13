@@ -590,7 +590,7 @@ def pallet_publish_all(pallet_id):
 
     drafts = query_db(
         """SELECT l.*, p.image_url, p.condition, p.quantity, p.ean, p.id as prod_id,
-                  p.shipping_method, p.shipping_cost_gbp
+                  p.shipping_method, p.shipping_cost_gbp, p.category
            FROM ebay_listings l
            JOIN products p ON p.id = l.product_id
            WHERE p.pallet_id = ? AND l.status = 'draft'""",
@@ -619,13 +619,15 @@ def pallet_publish_all(pallet_id):
             # Use product-specific shipping or defaults
             prod_shipping = draft.get('shipping_method') or shipping_key
             prod_shipping_cost = draft.get('shipping_cost_gbp') or 0
+            # Category from product (format: "id:name" or just "id")
+            _cat = (draft.get('category') or '175673').split(':')[0]
             result = ebay.create_listing({
                 'title': draft['title'],
                 'description': draft['description'],
                 'price': draft['price_gbp'],
                 'condition': draft['condition'],
                 'quantity': draft['quantity'],
-                'category_id': '175673',
+                'category_id': _cat,
                 'image_urls': image_urls,
                 'ean': draft.get('ean', ''),
                 'dispatch_days': 3,
@@ -1848,6 +1850,12 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
               onsubmit="return confirm('Publish all drafts to eBay? Listings go LIVE immediately.') && (document.getElementById('loadingOverlay').style.display='flex',document.getElementById('loadingText').textContent='Publishing to eBay...',true)">
             <button type="submit" class="btn btn-lime btn-sm">
                 <span class="material-symbols-outlined">sell</span> Publish All
+            </button>
+        </form>
+        <form method="POST" action="/pallet/{{ pallet.id }}/auto-categories" class="inline-form"
+              onsubmit="document.getElementById('loadingOverlay').style.display='flex';document.getElementById('loadingText').textContent='Matching categories...'">
+            <button type="submit" class="btn btn-outline btn-sm" style="border-color:rgba(168,85,247,0.3);color:#a855f7">
+                <span class="material-symbols-outlined">category</span> Auto Categories
             </button>
         </form>
         <form method="POST" action="/pallet/{{ pallet.id }}/scrape" class="inline-form">
@@ -3198,6 +3206,64 @@ def backup_upload():
     file.save(str(db_path))
     flash(f'Database restored from uploaded file: {file.filename}', 'success')
     return redirect(url_for('settings'))
+
+
+# ===================================================================
+# Category Matching
+# ===================================================================
+
+@app.route('/api/suggest-category', methods=['POST'])
+def api_suggest_category():
+    """Get eBay category suggestions for a product name."""
+    data = request.get_json() or {}
+    query = data.get('query', '')
+    if not query:
+        return jsonify({'ok': False, 'error': 'No query'})
+
+    ebay = get_ebay_client(get_config)
+    if not ebay.is_configured() or not ebay.user_token:
+        return jsonify({'ok': False, 'error': 'eBay API not configured'})
+
+    categories = ebay.get_suggested_categories(query)
+    return jsonify({'ok': True, 'categories': categories})
+
+
+@app.route('/pallet/<int:pallet_id>/auto-categories', methods=['POST'])
+def pallet_auto_categories(pallet_id):
+    """Auto-match eBay categories for all products in pallet."""
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    ebay = get_ebay_client(get_config)
+    if not ebay.is_configured() or not ebay.user_token:
+        flash('eBay API not configured. Go to Settings.', 'error')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    products = query_db(
+        "SELECT * FROM products WHERE pallet_id = ? AND name != ''",
+        (pallet_id,)
+    )
+
+    matched = 0
+    for product in products:
+        try:
+            cats = ebay.get_suggested_categories(product['name'][:80])
+            if cats:
+                best = cats[0]
+                execute_db(
+                    "UPDATE products SET category = ? WHERE id = ?",
+                    (f"{best['category_id']}:{best['category_name']}", product['id'])
+                )
+                matched += 1
+        except Exception as e:
+            print(f"[Category] Error for product {product['id']}: {e}")
+        import time
+        time.sleep(0.5)  # Rate limit
+
+    flash(f'Matched categories for {matched}/{len(products)} products.', 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
 # ===================================================================

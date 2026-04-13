@@ -523,6 +523,51 @@ class EbayAPI:
         return results
 
 
+    def get_suggested_categories(self, query):
+        """
+        Get suggested eBay categories for a product name.
+        Uses GetSuggestedCategories Trading API.
+
+        Args:
+            query: str - product name/keywords
+
+        Returns:
+            list of dicts: [{category_id, category_name}]
+        """
+        xml_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<GetSuggestedCategoriesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+    <RequesterCredentials>
+        <eBayAuthToken>{self._escape_xml(self.user_token)}</eBayAuthToken>
+    </RequesterCredentials>
+    <ErrorLanguage>en_GB</ErrorLanguage>
+    <Query>{self._escape_xml(query[:350])}</Query>
+</GetSuggestedCategoriesRequest>"""
+
+        success, root, error = self._make_trading_call('GetSuggestedCategories', xml_body)
+
+        categories = []
+        if success and root is not None:
+            for cat in root.findall('.//SuggestedCategory'):
+                cat_elem = cat.find('Category')
+                if cat_elem is not None:
+                    cat_id = cat_elem.findtext('CategoryID', '')
+                    cat_name = cat_elem.findtext('CategoryName', '')
+                    # Build full path from parent categories
+                    parent = cat_elem.findtext('CategoryParentID', '')
+                    pct = int(cat.findtext('PercentItemFound', '0') or '0')
+                    categories.append({
+                        'category_id': cat_id,
+                        'category_name': cat_name,
+                        'percent': pct,
+                    })
+            categories.sort(key=lambda x: -x['percent'])
+            print(f"[eBay API] GetSuggestedCategories: {len(categories)} found for '{query[:40]}'")
+        else:
+            print(f"[eBay API] GetSuggestedCategories failed: {error}")
+
+        return categories[:5]  # Top 5
+
+
 def get_ebay_client(config_getter):
     """
     Create an EbayAPI instance using stored config values.
