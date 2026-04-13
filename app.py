@@ -630,10 +630,6 @@ def pallet_publish_all(pallet_id):
             })
 
             if result and result.get('success'):
-                # Insert listing record
-                listing_id = execute_db(
-                    "INSERT INTO ebay_listings (product_id, ebay_item_id, title, description, price_gbp, status) "
-            if result and result.get('success'):
                 execute_db(
                     "UPDATE ebay_listings SET ebay_item_id=?, status='active' WHERE id=?",
                     (result['ebay_item_id'], draft['id'])
