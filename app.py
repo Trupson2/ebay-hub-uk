@@ -3391,59 +3391,85 @@ TEMPLATE_HELP = """
 <div class="page-header"><h1><span>Help & Guide</span></h1></div>
 
 <div class="card mb-16">
-    <div class="card-title" style="color:#8ff5ff">Quick Start</div>
-    <ol style="line-height:2;color:var(--text-muted);font-size:0.9rem">
-        <li><strong>Add a pallet:</strong> Go to Pallets → + Add Pallet → fill in name, price, supplier. Upload your CSV/XLSX file from the supplier.</li>
-        <li><strong>Set prices:</strong> Open the pallet → use Set Prices section → type prices or click Apply Multiplier (e.g. cost × 2.5).</li>
-        <li><strong>Match categories:</strong> Click Auto Categories → the app matches eBay categories automatically.</li>
-        <li><strong>Create drafts:</strong> Click Create Drafts → saves listings locally (NOT on eBay yet).</li>
-        <li><strong>Review:</strong> Go to Listings → check your drafts. Click on a product to edit title/description/price.</li>
-        <li><strong>Generate AI content:</strong> On product page, click Generate Title / Generate Description → AI creates eBay-optimized text.</li>
-        <li><strong>Publish:</strong> Go back to pallet → click Publish All → listings go LIVE on eBay (with confirmation).</li>
-        <li><strong>Ship orders:</strong> When something sells → go to Orders → Mark as Shipped with tracking number.</li>
+    <div class="card-title" style="color:#8ff5ff">Quick Start — The Easy Way</div>
+    <ol style="line-height:2.2;color:var(--text-muted);font-size:0.9rem">
+        <li><strong>Add a pallet:</strong> Go to <strong>Pallets</strong> → <strong>+ Add Pallet</strong> → fill in name, price (GBP), supplier. Upload your CSV/XLSX file from the joblot supplier.</li>
+        <li><strong>Auto Pipeline:</strong> Click <strong>Auto Pipeline</strong> on the pallet page → the app automatically:
+            <ul style="margin:4px 0 4px 20px;line-height:1.8">
+                <li>Downloads up to 8 product images from Amazon UK</li>
+                <li>Extracts product specifications (brand, model, etc.)</li>
+                <li>Generates eBay-optimized titles using AI</li>
+                <li>Generates professional HTML descriptions using AI</li>
+                <li>Matches the correct eBay category</li>
+                <li>Creates draft listings ready for review</li>
+            </ul>
+        </li>
+        <li><strong>Set prices:</strong> Use the <strong>Set Prices</strong> section → type prices manually or click <strong>Apply Multiplier</strong> (e.g. cost x 2.5 = your selling price).</li>
+        <li><strong>Review drafts:</strong> Go to <strong>Listings</strong> → check your drafts. Click on a product to edit title, description, or price.</li>
+        <li><strong>Publish:</strong> Go back to the pallet → click <strong>Publish All</strong> → listings go LIVE on eBay (you'll be asked to confirm).</li>
+        <li><strong>Ship orders:</strong> When something sells → go to <strong>Orders</strong> → click <strong>Mark as Shipped</strong> with the tracking number.</li>
     </ol>
 </div>
 
 <div class="card mb-16">
     <div class="card-title" style="color:#beee00">Buttons Explained</div>
-    <div style="display:grid;grid-template-columns:150px 1fr;gap:8px;font-size:0.85rem;color:var(--text-muted)">
-        <div><span class="btn btn-purple btn-sm" style="font-size:0.7rem">Import CSV</span></div><div>Upload CSV/XLSX file with products from your supplier</div>
-        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#f59e0b;color:#f59e0b">Create Drafts</span></div><div>Save listings locally — nothing goes to eBay yet</div>
-        <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Publish All</span></div><div>Send all drafts to eBay — listings go LIVE immediately!</div>
-        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#a855f7;color:#a855f7">Auto Categories</span></div><div>Automatically match eBay categories for your products</div>
-        <div><span class="btn btn-cyan btn-sm" style="font-size:0.7rem">Scrape Images</span></div><div>Download product images from Amazon UK</div>
-        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Title</span></div><div>AI creates an optimized eBay title (max 80 chars)</div>
-        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Description</span></div><div>AI creates HTML description with features and bullet points</div>
+    <div style="display:grid;grid-template-columns:170px 1fr;gap:10px 16px;font-size:0.85rem;color:var(--text-muted)">
+        <div><span class="btn btn-purple btn-sm" style="font-size:0.7rem">Import CSV</span></div><div>Upload CSV/XLSX file with products from your joblot supplier</div>
+        <div><span class="btn btn-sm" style="font-size:0.7rem;background:linear-gradient(135deg,#8ff5ff,#a855f7);color:#000">Auto Pipeline</span></div><div><strong>Does everything automatically!</strong> Images, titles, descriptions, categories, drafts — one click</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#f59e0b;color:#f59e0b">Create Drafts</span></div><div>Save listings locally — nothing goes to eBay yet. Review before publishing</div>
+        <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Publish All</span></div><div>Send all drafts to eBay — listings go LIVE immediately! <strong>Make sure prices are set first!</strong></div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#a855f7;color:#a855f7">Auto Categories</span></div><div>Match eBay categories for your products using AI</div>
+        <div><span class="btn btn-cyan btn-sm" style="font-size:0.7rem">Scrape Images</span></div><div>Re-download product images from Amazon UK</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Save Draft</span></div><div>Save title, description, and price without publishing to eBay</div>
+        <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Publish to eBay</span></div><div>Send this single product to eBay (goes live immediately)</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Title</span></div><div>AI creates an optimized eBay title (max 80 characters, English)</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Description</span></div><div>AI creates a professional HTML description with features and bullet points</div>
     </div>
 </div>
 
 <div class="card mb-16">
-    <div class="card-title" style="color:#ff6b9b">Shipping</div>
+    <div class="card-title" style="color:#ff6b9b">Shipping — How It Works</div>
     <p style="color:var(--text-muted);font-size:0.85rem;line-height:1.8">
-        When a customer buys your product on eBay:<br>
-        1. You'll see the order in <strong>Orders</strong> tab with status "TO SHIP"<br>
-        2. Pack the item and take it to the post office (Royal Mail) or drop-off point (Evri/DPD)<br>
-        3. Get a tracking number from the courier<br>
-        4. Click <strong>Mark as Shipped</strong> and enter the tracking number<br>
-        5. eBay transfers money to your bank account (usually 2-3 days after delivery)<br><br>
-        <strong>Tip:</strong> You can buy cheaper shipping labels directly from eBay: My eBay → Sold → Print Shipping Label
+        When a customer buys your product on eBay:<br><br>
+        <strong>1.</strong> You'll see the order in the <strong>Orders</strong> tab with status <strong>"TO SHIP"</strong><br>
+        <strong>2.</strong> Pack the item securely<br>
+        <strong>3.</strong> Take it to the post office (Royal Mail) or a drop-off point (Evri, DPD)<br>
+        <strong>4.</strong> Get a tracking number from the courier<br>
+        <strong>5.</strong> In the app, click <strong>Mark as Shipped</strong> and enter the tracking number<br>
+        <strong>6.</strong> eBay transfers the money to your bank account (usually 2-3 days after the buyer confirms delivery)<br><br>
+        <strong style="color:#8ff5ff">Tip:</strong> You can buy cheaper shipping labels directly from eBay!<br>
+        Go to: My eBay → Sold → Print Shipping Label — eBay has discounted rates with Royal Mail and Evri.<br><br>
+        <strong style="color:#8ff5ff">Tip:</strong> Set shipping cost to <strong>£0 (free postage)</strong> and include it in the product price — eBay shows free postage listings higher in search results!
     </p>
 </div>
 
 <div class="card mb-16">
     <div class="card-title" style="color:#f59e0b">Tips for Better Sales</div>
-    <ul style="color:var(--text-muted);font-size:0.85rem;line-height:2">
-        <li>Use <strong>free postage</strong> (set shipping cost to £0) — eBay ranks free postage listings higher</li>
-        <li>Add <strong>8+ photos</strong> — listings with more photos get 30% more sales</li>
-        <li>Write detailed <strong>titles with keywords</strong> buyers search for</li>
-        <li>Set <strong>competitive prices</strong> — check what similar items sold for on eBay</li>
-        <li>Ship quickly — fast dispatch improves your seller rating</li>
+    <ul style="color:var(--text-muted);font-size:0.85rem;line-height:2.2">
+        <li>Use <strong>free postage</strong> (set shipping cost to £0) — eBay ranks free postage listings higher in search</li>
+        <li>Use <strong>Auto Pipeline</strong> to generate professional titles and descriptions — saves hours of work</li>
+        <li>Add <strong>multiple photos</strong> — listings with 8+ photos get 30% more sales on eBay UK</li>
+        <li>Set <strong>competitive prices</strong> — check what similar items sold for on eBay before pricing</li>
+        <li>Ship <strong>within 1-2 days</strong> — fast dispatch improves your seller rating and search ranking</li>
+        <li>Always provide a <strong>tracking number</strong> — it protects you against "item not received" claims</li>
+        <li>Write titles with <strong>keywords buyers search for</strong> (brand, model, key specs)</li>
+        <li>For new accounts: eBay may <strong>hold funds for a few days</strong> — this is normal and stops after you build reputation</li>
     </ul>
 </div>
 
 <div class="card mb-16">
+    <div class="card-title" style="color:#ef4444">Common Problems</div>
+    <div style="color:var(--text-muted);font-size:0.85rem;line-height:1.8">
+        <p><strong>Error 120 — "Need additional information":</strong><br>Your eBay seller account is not fully set up. Go to <a href="https://www.ebay.co.uk/sh/sell" target="_blank" style="color:#8ff5ff">ebay.co.uk/sh/sell</a> and complete your bank details and identity verification.</p>
+        <p style="margin-top:12px"><strong>Error 107 — "Category not valid":</strong><br>The matched category ID is wrong. Click on the product → change the Category field to a valid eBay UK category number (e.g. 96915 for Chargers, 175673 for Computer Parts).</p>
+        <p style="margin-top:12px"><strong>Warning — "Funds on hold":</strong><br>This is normal for new sellers. eBay holds money until the buyer confirms delivery. After a few successful sales, this stops.</p>
+        <p style="margin-top:12px"><strong>No images showing:</strong><br>Click <strong>Scrape Images</strong> on the pallet page, or run <strong>Auto Pipeline</strong> again.</p>
+    </div>
+</div>
+
+<div class="card mb-16">
     <div class="card-title">Need Help?</div>
-    <p style="color:var(--text-muted);font-size:0.85rem">Contact Adrian for technical support.</p>
+    <p style="color:var(--text-muted);font-size:0.85rem">Contact Adrian for technical support. He can access the app remotely and fix any issues.</p>
 </div>
 """
 
