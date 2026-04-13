@@ -6,6 +6,7 @@ Parses pasted joblot specification text to extract product info.
 
 import re
 import time
+import json
 import logging
 import requests
 from bs4 import BeautifulSoup
@@ -162,6 +163,121 @@ def _extract_bullet_points(soup):
     return bullets
 
 
+def _extract_all_images(soup):
+    """Extract all product images (up to 8) from Amazon page."""
+    images = []
+
+    # Method 1: data-a-dynamic-image JSON on the landing image
+    img_el = soup.select_one('#landingImage') or soup.select_one('#imgBlkFront')
+    if img_el:
+        dyn = img_el.get('data-a-dynamic-image', '')
+        if dyn:
+            try:
+                img_dict = json.loads(dyn)
+                # Keys are URLs, values are [width, height] — sort by resolution desc
+                sorted_urls = sorted(img_dict.keys(),
+                                     key=lambda u: img_dict[u][0] * img_dict[u][1] if isinstance(img_dict[u], list) else 0,
+                                     reverse=True)
+                for url in sorted_urls:
+                    if url and 'placeholder' not in url.lower() and url not in images:
+                        images.append(url)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    # Method 2: Image gallery thumbnails (altImages)
+    alt_div = soup.select_one('#altImages') or soup.select_one('#imageBlock')
+    if alt_div:
+        for thumb in alt_div.select('img'):
+            src = thumb.get('src', '')
+            if not src or 'sprite' in src or 'grey-pixel' in src or 'play-button' in src:
+                continue
+            # Convert thumbnail URL to large image URL
+            # Thumbnails: ._SL75_ or ._SS40_ — replace with ._SL1500_
+            large = re.sub(r'\._[A-Z]{2}\d+_', '._SL1500_', src)
+            large = re.sub(r'\._[A-Z]{2}\d+,\d+_', '._SL1500_', large)
+            if large not in images and 'placeholder' not in large.lower():
+                images.append(large)
+
+    # Method 3: Script-based image data (imageGalleryData)
+    for script in soup.select('script[type="text/javascript"]'):
+        text = script.string or ''
+        if 'imageGalleryData' in text or "'colorImages'" in text or '"colorImages"' in text:
+            # Find all high-res image URLs in the script block
+            url_matches = re.findall(r'"(https://m\.media-amazon\.com/images/I/[^"]+\.jpg)"', text)
+            for url in url_matches:
+                if '_SL1500_' in url or '_SL1200_' in url or '_AC_' in url:
+                    if url not in images:
+                        images.append(url)
+
+    # Deduplicate and limit to 8
+    return images[:8]
+
+
+def _extract_item_specifics(soup):
+    """Extract item specifics (brand, model, material, etc.) from Amazon product page."""
+    specs = {}
+
+    # Method 1: Product details table (techSpec)
+    for table_id in ['productDetails_techSpec_section_1', 'productDetails_techSpec_section_2',
+                     'productDetails_detailBullets_sections1']:
+        table = soup.select_one(f'#{table_id}')
+        if table:
+            for row in table.select('tr'):
+                th = row.select_one('th')
+                td = row.select_one('td')
+                if th and td:
+                    key = th.get_text(strip=True).rstrip(':').strip()
+                    val = td.get_text(strip=True)
+                    if key and val and val.lower() not in ('', '-', 'n/a'):
+                        specs[key] = val
+
+    # Method 2: Detail Bullets feature div
+    detail_bullets = soup.select_one('#detailBullets_feature_div')
+    if detail_bullets:
+        for li in detail_bullets.select('li'):
+            spans = li.select('span.a-text-bold')
+            for bold_span in spans:
+                key = bold_span.get_text(strip=True).rstrip(':').strip()
+                # The value is in the next sibling span
+                sibling = bold_span.find_next_sibling('span')
+                if sibling:
+                    val = sibling.get_text(strip=True)
+                    if key and val and key not in ('Customer Reviews', 'Best Sellers Rank',
+                                                    'ASIN', 'Date First Available'):
+                        specs[key] = val
+
+    # Method 3: Product information tables (below-the-fold)
+    for table in soup.select('#productDetails_db_sections table, .prodDetTable'):
+        for row in table.select('tr'):
+            th = row.select_one('th')
+            td = row.select_one('td')
+            if th and td:
+                key = th.get_text(strip=True).rstrip(':').strip()
+                val = td.get_text(strip=True)
+                if key and val and val.lower() not in ('', '-', 'n/a'):
+                    if key not in ('Customer Reviews', 'Best Sellers Rank',
+                                   'ASIN', 'Date First Available'):
+                        specs[key] = val
+
+    # Clean up: only keep useful specifics for eBay
+    useful_keys = {
+        'Brand', 'Manufacturer', 'Model', 'Model Number', 'Model Name',
+        'Colour', 'Color', 'Material', 'Material Type', 'Weight',
+        'Item Weight', 'Product Dimensions', 'Package Dimensions',
+        'Power Source', 'Voltage', 'Wattage', 'Batteries',
+        'Connectivity Technology', 'Wireless Type', 'Compatible Devices',
+        'Special Feature', 'Special Features', 'Pattern',
+        'Size', 'Item Dimensions LxWxH', 'Capacity', 'Style',
+    }
+    filtered = {}
+    for k, v in specs.items():
+        for ukey in useful_keys:
+            if ukey.lower() == k.lower() or ukey.lower() in k.lower():
+                filtered[k] = v
+                break
+    return filtered
+
+
 def _extract_category(soup):
     """Extract product category from Amazon breadcrumbs."""
     breadcrumbs = soup.select('#wayfinding-breadcrumbs_feature_div li a')
@@ -227,14 +343,23 @@ def scrape_amazon_product(asin):
             price = _extract_price(soup)
             bullet_points = _extract_bullet_points(soup)
             category = _extract_category(soup)
+            all_images = _extract_all_images(soup)
+            item_specifics = _extract_item_specifics(soup)
 
-            logger.info(f"Scraped {asin} from {domain}: {title[:50]}...")
+            # Ensure main image is first in all_images
+            if image_url and image_url not in all_images:
+                all_images.insert(0, image_url)
+            all_images = all_images[:8]
+
+            logger.info(f"Scraped {asin} from {domain}: {title[:50]}... ({len(all_images)} images, {len(item_specifics)} specs)")
             return {
                 'title': title,
                 'image_url': image_url,
                 'price': price,
                 'bullet_points': bullet_points,
                 'category': category,
+                'all_images': all_images,
+                'item_specifics': item_specifics,
             }
 
         except requests.RequestException as e:

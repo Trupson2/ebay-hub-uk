@@ -7,7 +7,10 @@ Dark cyberpunk theme, mobile-first design.
 import os
 import csv
 import io
+import json
+import time
 import secrets
+import requests as http_requests
 from datetime import datetime, timedelta
 
 from flask import (
@@ -421,12 +424,22 @@ def pallet_add():
         except Exception as e:
             flash(f'File import error: {e}', 'error')
 
+    # Run auto-pipeline after import (scrape all images, AI titles/descriptions, create drafts)
+    pipeline_msg = ''
+    if imported > 0:
+        try:
+            processed, drafts = auto_process_products(pallet_id)
+            pipeline_msg = f' Auto-pipeline: {processed} scraped, {drafts} drafts created.'
+        except Exception as e:
+            pipeline_msg = f' Auto-pipeline error: {e}'
+
     msg = f'Pallet "{name}" added successfully.'
     if imported > 0:
         msg += f' Imported {imported} products'
         if scraped_cnt > 0:
             msg += f' (scraped {scraped_cnt} from Amazon UK)'
         msg += '.'
+    msg += pipeline_msg
     flash(msg, 'success')
     return redirect(url_for('pallet_detail', pallet_id=pallet_id) if imported > 0 else url_for('pallets_list'))
 
@@ -478,9 +491,12 @@ def pallet_scrape(pallet_id):
             new_name = amz_data.get('title') or prod['name']
             new_image = amz_data['image_url']
             new_price = amz_data.get('price') or prod['ebay_price_gbp']
+            # Save all images and item specifics if available
+            images_json = json.dumps(amz_data.get('all_images', []))
+            specs_json = json.dumps(amz_data.get('item_specifics', {}))
             execute_db(
-                "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ? WHERE id = ?",
-                (new_name, new_image, new_price, prod['id'])
+                "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ?, images = ?, item_specifics = ? WHERE id = ?",
+                (new_name, new_image, new_price, images_json, specs_json, prod['id'])
             )
             updated += 1
         else:
@@ -589,8 +605,8 @@ def pallet_publish_all(pallet_id):
         return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
     drafts = query_db(
-        """SELECT l.*, p.image_url, p.condition, p.quantity, p.ean, p.id as prod_id,
-                  p.shipping_method, p.shipping_cost_gbp, p.category
+        """SELECT l.*, p.image_url, p.images, p.condition, p.quantity, p.ean, p.id as prod_id,
+                  p.shipping_method, p.shipping_cost_gbp, p.category, p.item_specifics as prod_specs
            FROM ebay_listings l
            JOIN products p ON p.id = l.product_id
            WHERE p.pallet_id = ? AND l.status = 'draft'""",
@@ -614,13 +630,30 @@ def pallet_publish_all(pallet_id):
             errors.append(f"{draft['title'][:40]}: no price")
             continue
 
-        image_urls = [draft['image_url']] if draft.get('image_url') else []
+        # Use all images if available, fallback to single image
+        image_urls = []
+        try:
+            all_imgs = json.loads(draft.get('images') or '[]')
+            if all_imgs:
+                image_urls = all_imgs[:12]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if not image_urls and draft.get('image_url'):
+            image_urls = [draft['image_url']]
+
+        # Parse item specifics from listing or product
+        listing_specs = {}
+        try:
+            listing_specs = json.loads(draft.get('item_specifics') or draft.get('prod_specs') or '{}')
+        except (json.JSONDecodeError, TypeError):
+            pass
+
         try:
             # Use product-specific shipping or defaults
             prod_shipping = draft.get('shipping_method') or shipping_key
             prod_shipping_cost = draft.get('shipping_cost_gbp') or 0
-            # Category from product (format: "id:name" or just "id")
-            _cat = (draft.get('category') or '175673').split(':')[0]
+            # Category from listing or product (format: "id:name" or just "id")
+            _cat = (draft.get('category_id') or draft.get('category') or '175673').split(':')[0]
             result = ebay.create_listing({
                 'title': draft['title'],
                 'description': draft['description'],
@@ -632,6 +665,7 @@ def pallet_publish_all(pallet_id):
                 'ean': draft.get('ean', ''),
                 'dispatch_days': 3,
                 'shipping_service': prod_shipping,
+                'item_specifics': listing_specs,
                 'shipping_cost': prod_shipping_cost,
                 'return_days': return_days,
             })
@@ -827,6 +861,24 @@ def list_on_ebay(product_id):
     return_days = int(get_config('default_return_days', '30') or '30')
     cat = (product.get('category') or '175673').split(':')[0]
 
+    # Use all images if available
+    image_urls = []
+    try:
+        all_imgs = json.loads(product.get('images') or '[]')
+        if all_imgs:
+            image_urls = all_imgs[:12]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if not image_urls and product.get('image_url'):
+        image_urls = [product['image_url']]
+
+    # Parse item specifics
+    prod_specs = {}
+    try:
+        prod_specs = json.loads(product.get('item_specifics') or '{}')
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     result = ebay.create_listing({
         'title': title,
         'description': description,
@@ -835,11 +887,12 @@ def list_on_ebay(product_id):
         'quantity': product['quantity'],
         'category_id': cat,
         'ean': product['ean'],
-        'image_urls': [product['image_url']] if product['image_url'] else [],
+        'image_urls': image_urls,
         'dispatch_days': 3,
         'shipping_service': shipping_key,
         'shipping_cost': shipping_cost,
         'return_days': return_days,
+        'item_specifics': prod_specs,
     })
     if result and result.get('success'):
         execute_db("UPDATE ebay_listings SET ebay_item_id=?, status='active' WHERE id=?",
@@ -1574,7 +1627,7 @@ document.querySelectorAll('form').forEach(function(f){
         var btn = f.querySelector('button[type="submit"]');
         var hasFile = f.querySelector('input[type="file"]');
         var action = f.action || '';
-        var isSlow = hasFile || action.includes('/scrape') || action.includes('/import') || action.includes('/add') || action.includes('/list-all') || action.includes('/list_ebay') || action.includes('/publish-all') || action.includes('/create-drafts') || action.includes('/auto-categories') || action.includes('/mass-price');
+        var isSlow = hasFile || action.includes('/scrape') || action.includes('/import') || action.includes('/add') || action.includes('/list-all') || action.includes('/list_ebay') || action.includes('/publish-all') || action.includes('/create-drafts') || action.includes('/auto-categories') || action.includes('/auto-pipeline') || action.includes('/mass-price');
         if(isSlow){
             overlay.style.display='flex';
             if(btn) btn.disabled=true;
@@ -1879,6 +1932,12 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
               onsubmit="document.getElementById('loadingOverlay').style.display='flex';document.getElementById('loadingText').textContent='Matching categories...'">
             <button type="submit" class="btn btn-outline btn-sm" style="border-color:rgba(168,85,247,0.3);color:#a855f7">
                 <span class="material-symbols-outlined">category</span> Auto Categories
+            </button>
+        </form>
+        <form method="POST" action="/pallet/{{ pallet.id }}/auto-pipeline" class="inline-form"
+              onsubmit="document.getElementById('loadingOverlay').style.display='flex';document.getElementById('loadingText').textContent='Running auto-pipeline (scrape, AI, drafts)...'">
+            <button type="submit" class="btn btn-sm" style="background:linear-gradient(135deg,rgba(0,255,136,0.15),rgba(139,92,246,0.15));border:1px solid rgba(0,255,136,0.4);color:#00ff88;">
+                <span class="material-symbols-outlined">auto_fix_high</span> Auto Pipeline
             </button>
         </form>
         <form method="POST" action="/pallet/{{ pallet.id }}/scrape" class="inline-form">
@@ -2338,6 +2397,15 @@ def csv_import(pallet_id):
             msg = f'Imported {count} products'
             if scraped > 0:
                 msg += f' (scraped {scraped} from Amazon UK)'
+
+            # Run auto-pipeline (all images, AI titles/descriptions, drafts)
+            if count > 0:
+                try:
+                    processed, drafts = auto_process_products(pallet_id)
+                    msg += f'. Auto-pipeline: {processed} scraped, {drafts} drafts created'
+                except Exception as e:
+                    msg += f'. Auto-pipeline error: {e}'
+
             flash(msg + '.', 'success')
             return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
@@ -2370,10 +2438,47 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
 </div>
 
 <div class="detail-header">
-    {% if product.image_url %}
-    <img src="{{ product.image_url }}" alt="{{ product.name }}" class="detail-image"
-         onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><rect fill=%22%2312121a%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%236a6a80%22 font-size=%2214%22>No Image</text></svg>'">
-    {% endif %}
+    <div style="flex-shrink:0;">
+        {% set all_images = product.images|default('', true) %}
+        {% if all_images and all_images != '[]' and all_images != '' %}
+        <!-- Image Carousel -->
+        <div style="text-align:center;">
+            <img id="mainProductImage" src="{{ product.image_url or '' }}" alt="{{ product.name }}"
+                 class="detail-image" style="max-width:300px;max-height:300px;object-fit:contain;border-radius:8px;background:rgba(0,0,0,0.2);cursor:zoom-in"
+                 onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><rect fill=%22%2312121a%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%236a6a80%22 font-size=%2214%22>No Image</text></svg>'"
+                 onclick="window.open(this.src,'_blank')">
+            <div style="display:flex;gap:6px;margin-top:8px;justify-content:center;flex-wrap:wrap" id="thumbStrip">
+            </div>
+        </div>
+        <script>
+        (function(){
+            try {
+                var imgs = JSON.parse({{ all_images|tojson }});
+                var main = document.getElementById('mainProductImage');
+                var strip = document.getElementById('thumbStrip');
+                if (imgs && imgs.length > 0) {
+                    if (main && !main.src) main.src = imgs[0];
+                    imgs.forEach(function(url, i){
+                        var t = document.createElement('img');
+                        t.src = url;
+                        t.style.cssText = 'width:48px;height:48px;object-fit:contain;border-radius:4px;cursor:pointer;border:2px solid ' + (i===0?'#8ff5ff':'transparent') + ';background:rgba(0,0,0,0.3);';
+                        t.onerror = function(){ this.style.display='none'; };
+                        t.onclick = function(){
+                            main.src = url;
+                            strip.querySelectorAll('img').forEach(function(el){ el.style.borderColor='transparent'; });
+                            t.style.borderColor='#8ff5ff';
+                        };
+                        strip.appendChild(t);
+                    });
+                }
+            } catch(e){}
+        })();
+        </script>
+        {% elif product.image_url %}
+        <img src="{{ product.image_url }}" alt="{{ product.name }}" class="detail-image"
+             onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 200 200%22><rect fill=%22%2312121a%22 width=%22200%22 height=%22200%22/><text x=%2250%25%22 y=%2250%25%22 text-anchor=%22middle%22 fill=%22%236a6a80%22 font-size=%2214%22>No Image</text></svg>'">
+        {% endif %}
+    </div>
     <div class="detail-info">
         <h2>{{ product.name }}</h2>
         <dl class="detail-meta">
@@ -2388,6 +2493,39 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         </dl>
     </div>
 </div>
+
+<!-- Item Specifics -->
+{% set specs_raw = product.item_specifics|default('', true) %}
+{% if specs_raw and specs_raw != '{}' and specs_raw != '' %}
+<div class="section-title">Item Specifics</div>
+<div class="card">
+    <div class="table-wrap">
+        <table>
+            <thead><tr><th>Property</th><th>Value</th></tr></thead>
+            <tbody id="specsTable"></tbody>
+        </table>
+    </div>
+</div>
+<script>
+(function(){
+    try {
+        var specs = JSON.parse({{ specs_raw|tojson }});
+        var tbody = document.getElementById('specsTable');
+        for (var key in specs) {
+            var tr = document.createElement('tr');
+            var td1 = document.createElement('td');
+            td1.textContent = key;
+            td1.style.cssText = 'font-weight:600;color:#8ff5ff;width:40%;';
+            var td2 = document.createElement('td');
+            td2.textContent = specs[key];
+            tr.appendChild(td1);
+            tr.appendChild(td2);
+            tbody.appendChild(tr);
+        }
+    } catch(e){}
+})();
+</script>
+{% endif %}
 
 <!-- Edit Product -->
 <div class="section-title">Edit Product</div>
@@ -3330,6 +3468,204 @@ def api_suggest_category():
 
     categories = ebay.get_suggested_categories(query)
     return jsonify({'ok': True, 'categories': categories})
+
+
+# ===================================================================
+# Auto-Pipeline: Full product processing after CSV import
+# ===================================================================
+
+def _gemini_call(api_key, prompt, timeout=15):
+    """Call Gemini API and return the text response, or None on failure."""
+    try:
+        resp = http_requests.post(
+            f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}',
+            json={'contents': [{'parts': [{'text': prompt}]}]},
+            timeout=timeout
+        )
+        result = resp.json()
+        if 'candidates' in result and result['candidates']:
+            return result['candidates'][0]['content']['parts'][0]['text'].strip()
+    except Exception as e:
+        print(f"[AutoPipeline] Gemini error: {e}")
+    return None
+
+
+def auto_process_products(pallet_id):
+    """
+    Auto-pipeline: After CSV import, process each product:
+    1. Scrape Amazon for all images + item specifics
+    2. Generate eBay-optimized title via Gemini
+    3. Generate HTML description via Gemini
+    4. Match eBay category via Gemini
+    5. Create draft listing with all data
+    """
+    products = query_db("SELECT * FROM products WHERE pallet_id = ?", (pallet_id,))
+    gemini_key = get_config('gemini_api_key', '')
+
+    processed = 0
+    drafts_created = 0
+
+    for product in products:
+        pid = product['id']
+        product_name = product['name']
+        all_images = []
+        item_specifics = {}
+        bullet_points = []
+
+        # --- Step 1: Scrape Amazon (all images + item specifics) ---
+        if product['asin']:
+            try:
+                data = scrape_amazon_product(product['asin'])
+                if data:
+                    all_images = data.get('all_images', [])
+                    item_specifics = data.get('item_specifics', {})
+                    bullet_points = data.get('bullet_points', [])
+
+                    images_json = json.dumps(all_images)
+                    specs_json = json.dumps(item_specifics)
+
+                    # Update product with images and specs
+                    execute_db(
+                        "UPDATE products SET images=?, item_specifics=? WHERE id=?",
+                        (images_json, specs_json, pid)
+                    )
+
+                    # Update main image if we got a better one
+                    if data.get('image_url') and not product['image_url']:
+                        execute_db("UPDATE products SET image_url=? WHERE id=?",
+                                   (data['image_url'], pid))
+
+                    # Update name if Amazon title is better
+                    if data.get('title') and len(data['title']) > len(product_name):
+                        product_name = data['title']
+                        execute_db("UPDATE products SET name=? WHERE id=?",
+                                   (product_name, pid))
+
+                    # Update price if we have none
+                    if data.get('price') and (product['ebay_price_gbp'] or 0) == 0:
+                        execute_db("UPDATE products SET ebay_price_gbp=? WHERE id=?",
+                                   (data['price'], pid))
+
+                    processed += 1
+            except Exception as e:
+                print(f"[AutoPipeline] Scrape error for {product['asin']}: {e}")
+
+        # --- Steps 2-4: Gemini AI (title, description, category) ---
+        ebay_title = product_name[:80]
+        ebay_description = ''
+        ebay_category = product.get('category', '')
+
+        if gemini_key:
+            # Build context for AI from bullet points and specs
+            context_parts = []
+            if bullet_points:
+                context_parts.append("Features: " + "; ".join(bullet_points[:5]))
+            if item_specifics:
+                specs_text = ", ".join(f"{k}: {v}" for k, v in list(item_specifics.items())[:10])
+                context_parts.append("Specs: " + specs_text)
+            context = "\n".join(context_parts) if context_parts else ""
+
+            # --- Step 2: Generate eBay-optimized title ---
+            title_prompt = (
+                f'Generate a concise eBay UK listing title (max 80 characters) for this product. '
+                f'Include key specs, brand, and model. No quotes, no special characters. English only.\n\n'
+                f'Product: {product_name}\n'
+                f'{context}\n\n'
+                f'Return ONLY the title, nothing else.'
+            )
+            ai_title = _gemini_call(gemini_key, title_prompt)
+            if ai_title:
+                ebay_title = ai_title.strip('"\'')[:80]
+            time.sleep(1)
+
+            # --- Step 3: Generate HTML description ---
+            desc_prompt = (
+                f'Generate a professional eBay UK product description in HTML. '
+                f'Include: product highlights as bullet points, key specifications table, '
+                f'condition note, and professional closing. '
+                f'Use clean HTML (div, ul, li, p, strong, table tags). '
+                f'Do NOT include <html>, <head>, or <body> tags. '
+                f'Keep it concise but informative. English only.\n\n'
+                f'Product: {product_name}\n'
+                f'Condition: {product.get("condition", "new")}\n'
+                f'{context}\n\n'
+                f'Return ONLY the HTML description, no markdown, no code blocks.'
+            )
+            ai_desc = _gemini_call(gemini_key, desc_prompt, timeout=20)
+            if ai_desc:
+                # Remove markdown code blocks if present
+                text = ai_desc
+                if text.startswith('```'):
+                    text = text.split('\n', 1)[1] if '\n' in text else text
+                    if text.endswith('```'):
+                        text = text[:-3]
+                ebay_description = text
+            time.sleep(1)
+
+            # --- Step 4: Match eBay category via Gemini ---
+            if not ebay_category:
+                cat_prompt = (
+                    f'What is the best eBay UK category for this product? '
+                    f'Return ONLY the eBay category ID number and name, format: "ID:Name"\n'
+                    f'Example: "175673:USB Hubs"\n\n'
+                    f'Product: {product_name[:120]}\n'
+                    f'{context}'
+                )
+                ai_cat = _gemini_call(gemini_key, cat_prompt)
+                if ai_cat and ':' in ai_cat:
+                    ebay_category = ai_cat.strip('"\'')
+                    execute_db("UPDATE products SET category=? WHERE id=?",
+                               (ebay_category, pid))
+                time.sleep(1)
+
+        # --- Step 5: Create draft listing ---
+        # Skip if draft already exists
+        existing = query_db(
+            "SELECT id FROM ebay_listings WHERE product_id = ? AND status = 'draft'",
+            (pid,), one=True
+        )
+        if not existing:
+            # Fallback description if Gemini didn't produce one
+            if not ebay_description:
+                ebay_description = (
+                    '<div style="font-family:Arial,sans-serif">'
+                    f'<h2>{ebay_title}</h2>'
+                    f'<p>{product_name}</p>'
+                    f'<p>Condition: {product.get("condition", "new").replace("_", " ").title()}</p>'
+                    '<p>Fast dispatch from UK warehouse.</p>'
+                    '</div>'
+                )
+
+            price = product['ebay_price_gbp'] or 0.0
+            cat_id = ebay_category.split(':')[0] if ebay_category else ''
+
+            execute_db(
+                "INSERT INTO ebay_listings (product_id, title, description, price_gbp, "
+                "status, category_id, item_specifics) VALUES (?, ?, ?, ?, 'draft', ?, ?)",
+                (pid, ebay_title, ebay_description, price,
+                 cat_id, json.dumps(item_specifics))
+            )
+            drafts_created += 1
+
+    return processed, drafts_created
+
+
+@app.route('/pallet/<int:pallet_id>/auto-pipeline', methods=['POST'])
+def pallet_auto_pipeline(pallet_id):
+    """Run the full auto-pipeline on all products in a pallet."""
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    processed, drafts = auto_process_products(pallet_id)
+    gemini_key = get_config('gemini_api_key', '')
+
+    msg = f'Auto-pipeline complete: {processed} products scraped, {drafts} drafts created.'
+    if not gemini_key:
+        msg += ' (AI features skipped - set Gemini API key in Settings)'
+    flash(msg, 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
 @app.route('/pallet/<int:pallet_id>/auto-categories', methods=['POST'])

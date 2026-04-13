@@ -158,6 +158,7 @@ class EbayAPI:
                 - shipping_service: str (config key, default 'royal_mail_2nd')
                 - shipping_cost: float (override, optional)
                 - return_days: int (default 30)
+                - item_specifics: dict (optional, key-value pairs for eBay ItemSpecifics)
 
         Returns:
             dict with success, ebay_item_id, listing_url, fees, error
@@ -196,6 +197,22 @@ class EbayAPI:
                 <EAN>{self._escape_xml(ean)}</EAN>
             </ProductListingDetails>"""
 
+        # Build ItemSpecifics XML from dict
+        item_specifics = product_data.get('item_specifics', {})
+        item_specifics_xml = ''
+        if item_specifics and isinstance(item_specifics, dict):
+            nvl_parts = []
+            for spec_name, spec_value in item_specifics.items():
+                if spec_name and spec_value:
+                    nvl_parts.append(
+                        f'<NameValueList>'
+                        f'<Name>{self._escape_xml(str(spec_name)[:65])}</Name>'
+                        f'<Value>{self._escape_xml(str(spec_value)[:65])}</Value>'
+                        f'</NameValueList>'
+                    )
+            if nvl_parts:
+                item_specifics_xml = '<ItemSpecifics>\n' + '\n'.join(nvl_parts) + '\n</ItemSpecifics>'
+
         xml_body = f"""<?xml version="1.0" encoding="utf-8"?>
 <AddItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
     <RequesterCredentials>
@@ -223,6 +240,7 @@ class EbayAPI:
             {picture_xml}
         </PictureDetails>
         {product_listing_details}
+        {item_specifics_xml}
         <ReturnPolicy>
             <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
             <ReturnsWithinOption>Days_30</ReturnsWithinOption>

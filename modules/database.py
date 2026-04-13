@@ -113,6 +113,10 @@ def init_db():
         ('products', 'height_cm', 'REAL DEFAULT 0.0'),
         ('products', 'shipping_method', "TEXT DEFAULT ''"),
         ('products', 'shipping_cost_gbp', 'REAL DEFAULT 0.0'),
+        ('products', 'images', "TEXT DEFAULT ''"),
+        ('products', 'item_specifics', "TEXT DEFAULT ''"),
+        ('ebay_listings', 'category_id', "TEXT DEFAULT ''"),
+        ('ebay_listings', 'item_specifics', "TEXT DEFAULT ''"),
     ]
     for table, col, col_type in _migrations:
         try:
