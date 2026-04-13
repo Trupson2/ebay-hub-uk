@@ -589,7 +589,8 @@ def pallet_publish_all(pallet_id):
         return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
     drafts = query_db(
-        """SELECT l.*, p.image_url, p.condition, p.quantity, p.ean, p.id as prod_id
+        """SELECT l.*, p.image_url, p.condition, p.quantity, p.ean, p.id as prod_id,
+                  p.shipping_method, p.shipping_cost_gbp
            FROM ebay_listings l
            JOIN products p ON p.id = l.product_id
            WHERE p.pallet_id = ? AND l.status = 'draft'""",
@@ -615,6 +616,9 @@ def pallet_publish_all(pallet_id):
 
         image_urls = [draft['image_url']] if draft.get('image_url') else []
         try:
+            # Use product-specific shipping or defaults
+            prod_shipping = draft.get('shipping_method') or shipping_key
+            prod_shipping_cost = draft.get('shipping_cost_gbp') or 0
             result = ebay.create_listing({
                 'title': draft['title'],
                 'description': draft['description'],
@@ -625,7 +629,8 @@ def pallet_publish_all(pallet_id):
                 'image_urls': image_urls,
                 'ean': draft.get('ean', ''),
                 'dispatch_days': 3,
-                'shipping_service': shipping_key,
+                'shipping_service': prod_shipping,
+                'shipping_cost': prod_shipping_cost,
                 'return_days': return_days,
             })
 
@@ -704,6 +709,12 @@ def product_update(product_id):
     ebay_price = request.form.get('ebay_price_gbp', '0')
     category = request.form.get('category', '').strip()
     status = request.form.get('status', 'warehouse')
+    weight_kg = request.form.get('weight_kg', '0')
+    length_cm = request.form.get('length_cm', '0')
+    width_cm = request.form.get('width_cm', '0')
+    height_cm = request.form.get('height_cm', '0')
+    shipping_method = request.form.get('shipping_method', '')
+    shipping_cost = request.form.get('shipping_cost_gbp', '0')
 
     try:
         quantity = int(quantity)
@@ -713,14 +724,24 @@ def product_update(product_id):
         ebay_price = float(ebay_price)
     except ValueError:
         ebay_price = 0.0
+    try:
+        weight_kg = float(weight_kg or 0)
+        length_cm = float(length_cm or 0)
+        width_cm = float(width_cm or 0)
+        height_cm = float(height_cm or 0)
+        shipping_cost = float(shipping_cost or 0)
+    except ValueError:
+        weight_kg = length_cm = width_cm = height_cm = shipping_cost = 0.0
 
     image_url = amazon_image(asin)
 
     execute_db(
         "UPDATE products SET name=?, asin=?, ean=?, quantity=?, condition=?, "
-        "ebay_price_gbp=?, category=?, image_url=?, status=? WHERE id=?",
+        "ebay_price_gbp=?, category=?, image_url=?, status=?, "
+        "weight_kg=?, length_cm=?, width_cm=?, height_cm=?, shipping_method=?, shipping_cost_gbp=? WHERE id=?",
         (name, asin, ean, quantity, condition, ebay_price,
-         category, image_url, status, product_id)
+         category, image_url, status,
+         weight_kg, length_cm, width_cm, height_cm, shipping_method, shipping_cost, product_id)
     )
     flash('Product updated.', 'success')
     return redirect(url_for('product_detail', product_id=product_id))
@@ -2391,6 +2412,51 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
                 <input type="text" name="category" class="form-control" value="{{ product.category }}">
             </div>
         </div>
+
+        <!-- Shipping & Dimensions -->
+        <div style="border-top:1px solid rgba(255,255,255,0.06);margin-top:16px;padding-top:16px">
+            <div style="font-size:0.8rem;font-weight:700;color:#f59e0b;margin-bottom:12px;display:flex;align-items:center;gap:6px">
+                <span class="material-symbols-outlined" style="font-size:1rem">local_shipping</span> Shipping & Dimensions
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Weight (kg)</label>
+                    <input type="number" step="0.01" name="weight_kg" class="form-control" value="{{ product.weight_kg or '' }}" placeholder="0.00">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Length (cm)</label>
+                    <input type="number" step="1" name="length_cm" class="form-control" value="{{ product.length_cm|int if product.length_cm else '' }}" placeholder="0">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Width (cm)</label>
+                    <input type="number" step="1" name="width_cm" class="form-control" value="{{ product.width_cm|int if product.width_cm else '' }}" placeholder="0">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Height (cm)</label>
+                    <input type="number" step="1" name="height_cm" class="form-control" value="{{ product.height_cm|int if product.height_cm else '' }}" placeholder="0">
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Shipping Method</label>
+                    <select name="shipping_method" class="form-control">
+                        <option value="" {{ 'selected' if not product.shipping_method }}>Use default (Settings)</option>
+                        <option value="royal_mail_2nd" {{ 'selected' if product.shipping_method == 'royal_mail_2nd' }}>Royal Mail 2nd Class</option>
+                        <option value="royal_mail_1st" {{ 'selected' if product.shipping_method == 'royal_mail_1st' }}>Royal Mail 1st Class</option>
+                        <option value="royal_mail_tracked" {{ 'selected' if product.shipping_method == 'royal_mail_tracked' }}>Royal Mail Tracked</option>
+                        <option value="hermes" {{ 'selected' if product.shipping_method == 'hermes' }}>Evri (Hermes)</option>
+                        <option value="dpd" {{ 'selected' if product.shipping_method == 'dpd' }}>DPD</option>
+                        <option value="collect" {{ 'selected' if product.shipping_method == 'collect' }}>Collection Only</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Shipping Cost (GBP)</label>
+                    <input type="number" step="0.01" name="shipping_cost_gbp" class="form-control" value="{{ product.shipping_cost_gbp or '' }}" placeholder="0.00 = free postage">
+                    <div class="form-hint">0 = free postage (recommended for better sales)</div>
+                </div>
+            </div>
+        </div>
+
         <div class="d-flex gap-8" style="margin-top: 16px;">
             <button type="submit" class="btn btn-cyan">
                 <span class="material-symbols-outlined">save</span> Save Changes

@@ -57,6 +57,12 @@ def init_db():
             cost_per_unit REAL DEFAULT 0.0,
             category TEXT DEFAULT '',
             image_url TEXT DEFAULT '',
+            weight_kg REAL DEFAULT 0.0,
+            length_cm REAL DEFAULT 0.0,
+            width_cm REAL DEFAULT 0.0,
+            height_cm REAL DEFAULT 0.0,
+            shipping_method TEXT DEFAULT '',
+            shipping_cost_gbp REAL DEFAULT 0.0,
             status TEXT DEFAULT 'warehouse' CHECK(status IN ('warehouse', 'listed', 'sold', 'shipped')),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (pallet_id) REFERENCES pallets(id)
@@ -98,6 +104,25 @@ def init_db():
         );
     """)
     conn.commit()
+
+    # Migrations for existing databases
+    _migrations = [
+        ('products', 'weight_kg', 'REAL DEFAULT 0.0'),
+        ('products', 'length_cm', 'REAL DEFAULT 0.0'),
+        ('products', 'width_cm', 'REAL DEFAULT 0.0'),
+        ('products', 'height_cm', 'REAL DEFAULT 0.0'),
+        ('products', 'shipping_method', "TEXT DEFAULT ''"),
+        ('products', 'shipping_cost_gbp', 'REAL DEFAULT 0.0'),
+    ]
+    for table, col, col_type in _migrations:
+        try:
+            conn.execute(f'SELECT {col} FROM {table} LIMIT 1')
+        except:
+            try:
+                conn.execute(f'ALTER TABLE {table} ADD COLUMN {col} {col_type}')
+                conn.commit()
+            except:
+                pass
 
 
 def get_config(key, default=''):
