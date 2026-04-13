@@ -2410,7 +2410,15 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         </div>
         <div class="form-group">
             <label class="form-label">Description</label>
-            <textarea name="description" class="form-control" rows="4" placeholder="Product description for eBay listing..."></textarea>
+            <textarea name="description" id="descInput" class="form-control" rows="6" placeholder="Product description for eBay listing..." oninput="updatePreview()"></textarea>
+            <div style="margin-top:8px">
+                <button type="button" onclick="document.getElementById('descPreview').style.display=document.getElementById('descPreview').style.display==='none'?'block':'none'" class="btn btn-outline btn-sm" style="font-size:0.7rem">
+                    <span class="material-symbols-outlined" style="font-size:0.85rem">visibility</span> Toggle Preview
+                </button>
+            </div>
+            <div id="descPreview" style="display:none;margin-top:8px;padding:16px;background:#fff;color:#333;font-family:Arial,sans-serif;font-size:14px;line-height:1.6;border:1px solid #ddd;max-height:400px;overflow-y:auto">
+                <div id="descPreviewContent" style="word-wrap:break-word">Click "Generate Description" or type HTML above to see preview</div>
+            </div>
         </div>
         <div class="form-group">
             <label class="form-label">Price (GBP)</label>
@@ -2430,6 +2438,14 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
     </form>
 </div>
 <script>
+function updatePreview() {
+    var html = document.getElementById('descInput').value;
+    var preview = document.getElementById('descPreviewContent');
+    if (html.trim()) {
+        preview.innerHTML = html;
+        document.getElementById('descPreview').style.display = 'block';
+    }
+}
 function generateAI(type) {
     var btn = document.getElementById(type === 'title' ? 'genTitleBtn' : 'genDescBtn');
     var oldText = btn.innerHTML;
@@ -2443,7 +2459,7 @@ function generateAI(type) {
     }).then(r => r.json()).then(d => {
         if (d.ok) {
             if (type === 'title') document.querySelector('[name="title"]').value = d.text;
-            else document.querySelector('[name="description"]').value = d.text;
+            else { document.querySelector('[name="description"]').value = d.text; updatePreview(); }
             btn.innerHTML = '<span class="material-symbols-outlined">check</span> Done!';
             setTimeout(() => { btn.innerHTML = oldText; btn.disabled = false; }, 2000);
         } else {
