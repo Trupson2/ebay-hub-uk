@@ -2440,15 +2440,6 @@ function generateAI(type) {
 <div class="section-title">Listing History</div>
 <div class="table-wrap">
     <table>
-        </div>
-    </form>
-</div>
-
-<!-- Listings History -->
-{% if listings %}
-<div class="section-title">Listing History</div>
-<div class="table-wrap">
-    <table>
         <thead>
             <tr>
                 <th>Title</th>
