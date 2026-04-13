@@ -10,7 +10,7 @@ echo "  eBay Hub UK — Deploy na Pi"
 echo "=========================================="
 
 APP_DIR="/home/pi/ebay-hub-uk"
-PORT=5001
+PORT=5002
 NGROK_TOKEN="3CGUCL7uYfPI2e4VApxmqg8KQPH_7N83Vy465GtcA22RwcZFt"
 
 # 1. Zainstaluj zależności systemowe
@@ -36,7 +36,7 @@ version: "2"
 authtoken: 3CGUCL7uYfPI2e4VApxmqg8KQPH_7N83Vy465GtcA22RwcZFt
 tunnels:
   ebay-hub:
-    addr: 5001
+    addr: 5002
     proto: http
 NGROK_EOF
 

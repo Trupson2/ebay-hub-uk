@@ -1508,29 +1508,47 @@ TEMPLATE_BASE = """<!DOCTYPE html>
 </div>
 
 <!-- Loading Spinner Overlay -->
-<div id="loadingOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:99999;align-items:center;justify-content:center;flex-direction:column;gap:16px">
-    <div style="width:48px;height:48px;border:3px solid rgba(143,245,255,0.15);border-top:3px solid #8ff5ff;border-radius:50%;animation:spin 0.8s linear infinite"></div>
-    <div id="loadingText" style="color:#8ff5ff;font-family:'Space Grotesk',sans-serif;font-size:0.95rem;font-weight:600">Processing...</div>
-    <div style="color:rgba(255,255,255,0.4);font-size:0.75rem">Scraping Amazon UK may take a moment</div>
+<div id="loadingOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:99999;align-items:center;justify-content:center;flex-direction:column;gap:16px">
+    <div style="width:56px;height:56px;border:3px solid rgba(143,245,255,0.15);border-top:3px solid #8ff5ff;border-radius:50%;animation:spin 0.8s linear infinite"></div>
+    <div id="loadingText" style="color:#8ff5ff;font-family:'Space Grotesk',sans-serif;font-size:1.1rem;font-weight:700">Processing...</div>
+    <div id="loadingSubtext" style="color:rgba(255,255,255,0.5);font-size:0.8rem">This may take a few minutes for large files</div>
+    <div id="loadingTimer" style="color:rgba(143,245,255,0.4);font-size:0.75rem;font-family:monospace">00:00</div>
+    <div style="margin-top:12px;padding:12px 24px;background:rgba(143,245,255,0.06);border:1px solid rgba(143,245,255,0.12);max-width:320px;text-align:center">
+        <div style="font-size:0.7rem;color:rgba(255,255,255,0.3)">Do NOT close this page</div>
+    </div>
 </div>
 <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
 <script>
 if('serviceWorker' in navigator){navigator.serviceWorker.register('/static/sw.js')}
 // Show spinner on form submit (for imports/scraping)
+var _loadingStart = 0;
 document.querySelectorAll('form').forEach(function(f){
     f.addEventListener('submit', function(){
         var overlay = document.getElementById('loadingOverlay');
         var btn = f.querySelector('button[type="submit"]');
         var hasFile = f.querySelector('input[type="file"]');
-        var isScrape = f.action && (f.action.includes('/scrape') || f.action.includes('/import') || f.action.includes('/add') || f.action.includes('/list-all') || f.action.includes('/list_ebay'));
-        if(isScrape || hasFile){
+        var action = f.action || '';
+        var isSlow = hasFile || action.includes('/scrape') || action.includes('/import') || action.includes('/add') || action.includes('/list-all') || action.includes('/list_ebay') || action.includes('/publish-all') || action.includes('/create-drafts');
+        if(isSlow){
             overlay.style.display='flex';
             if(btn) btn.disabled=true;
-            var dots = 0;
+            _loadingStart = Date.now();
+            // Context-aware messages
+            var msg = 'Processing...';
+            var sub = 'Please wait';
+            if(action.includes('/import') || (hasFile && action.includes('/add'))) { msg='Importing products...'; sub='Scraping Amazon UK for images & prices'; }
+            else if(action.includes('/scrape')) { msg='Scraping images...'; sub='Fetching from Amazon UK (~3s per product)'; }
+            else if(action.includes('/publish') || action.includes('/list')) { msg='Publishing to eBay...'; sub='Sending listings to eBay UK'; }
+            else if(action.includes('/create-drafts')) { msg='Creating drafts...'; sub='Saving listings locally'; }
+            document.getElementById('loadingText').textContent = msg;
+            document.getElementById('loadingSubtext').textContent = sub;
+            // Timer
             setInterval(function(){
-                dots = (dots+1)%4;
-                document.getElementById('loadingText').textContent = 'Importing & scraping' + '.'.repeat(dots);
-            }, 500);
+                var elapsed = Math.floor((Date.now() - _loadingStart) / 1000);
+                var min = Math.floor(elapsed/60);
+                var sec = elapsed%60;
+                document.getElementById('loadingTimer').textContent = (min<10?'0':'')+min+':'+(sec<10?'0':'')+sec;
+            }, 1000);
         }
     });
 });
