@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 
 from flask import (
     Flask, request, redirect, url_for, flash,
-    render_template_string, jsonify, g
+    render_template_string, jsonify, g, session
 )
 
 from modules.database import (
