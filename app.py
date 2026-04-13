@@ -3137,7 +3137,7 @@ def api_generate_title():
     try:
         import requests as _req
         resp = _req.post(
-            f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}',
+            f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}',
             json={
                 'contents': [{'parts': [{'text':
                     f'Generate a concise eBay UK listing title (max 80 characters) for this product. '
@@ -3149,9 +3149,14 @@ def api_generate_title():
             timeout=15
         )
         result = resp.json()
+        if 'error' in result:
+            return jsonify({'ok': False, 'error': result['error'].get('message', 'Gemini API error')[:100]})
+        if 'candidates' not in result or not result['candidates']:
+            return jsonify({'ok': False, 'error': 'Gemini returned no results. Check API key.'})
         text = result['candidates'][0]['content']['parts'][0]['text'].strip().strip('"\'')
         return jsonify({'ok': True, 'text': text[:80]})
     except Exception as e:
+        print(f"[AI] Generate title error: {e}")
         return jsonify({'ok': False, 'error': str(e)[:100]})
 
 
@@ -3171,7 +3176,7 @@ def api_generate_description():
     try:
         import requests as _req
         resp = _req.post(
-            f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}',
+            f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}',
             json={
                 'contents': [{'parts': [{'text':
                     f'Generate a professional eBay UK product description in HTML for this product. '
@@ -3186,6 +3191,10 @@ def api_generate_description():
             timeout=20
         )
         result = resp.json()
+        if 'error' in result:
+            return jsonify({'ok': False, 'error': result['error'].get('message', 'Gemini API error')[:100]})
+        if 'candidates' not in result or not result['candidates']:
+            return jsonify({'ok': False, 'error': 'Gemini returned no results. Check API key.'})
         text = result['candidates'][0]['content']['parts'][0]['text'].strip()
         # Remove markdown code blocks if present
         if text.startswith('```'):
