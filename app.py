@@ -3607,9 +3607,13 @@ def auto_process_products(pallet_id):
             # --- Step 4: Match eBay category via Gemini ---
             if not ebay_category:
                 cat_prompt = (
-                    f'What is the best eBay UK category for this product? '
-                    f'Return ONLY the eBay category ID number and name, format: "ID:Name"\n'
-                    f'Example: "175673:USB Hubs"\n\n'
+                    f'What is the best eBay UK category ID for this product? '
+                    f'Use REAL eBay.co.uk category IDs (5 or 6 digit numbers). '
+                    f'Return ONLY the category ID and name, format: "ID:Name"\n'
+                    f'Common eBay UK categories: 171485:Laptop Accessories, 175673:Computer Components, '
+                    f'44985:Cell Phone Accessories, 96915:Laptop Chargers, 20710:Consumer Electronics, '
+                    f'11071:Home Furniture, 3270:Action Figures, 11700:Cameras, 64313:Car Parts, '
+                    f'15032:Pet Supplies, 11450:Clothing, 11116:Garden Tools, 58058:Smart Home\n\n'
                     f'Product: {product_name[:120]}\n'
                     f'{context}'
                 )
@@ -3712,9 +3716,11 @@ def pallet_auto_categories(pallet_id):
                 resp = _req.post(
                     f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}',
                     json={'contents': [{'parts': [{'text':
-                        f'What is the best eBay UK category for this product? '
-                        f'Return ONLY the eBay category ID number and name, format: "ID:Name"\n'
-                        f'Example: "175673:USB Hubs"\n\n'
+                        f'What is the best eBay UK category ID for this product? '
+                        f'Use REAL eBay.co.uk category IDs (5-6 digit numbers). '
+                        f'Return ONLY format: "ID:Name"\n'
+                        f'Common: 171485:Laptop Accessories, 175673:Computer Components, '
+                        f'44985:Cell Phone Accessories, 96915:Laptop Chargers, 20710:Consumer Electronics\n\n'
                         f'Product: {product["name"][:100]}'
                     }]}]},
                     timeout=10
