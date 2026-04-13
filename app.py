@@ -1842,17 +1842,37 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
         <div class="card-subtitle">{{ stats.warehouse }} warehouse / {{ stats.listed }} listed / {{ stats.sold }} sold</div>
     </div>
     <div class="card">
-        <div class="card-title">Revenue</div>
+        <div class="card-title">Actual Revenue</div>
         <div class="card-value lime">{{ fmt_gbp(stats.revenue) }}</div>
     </div>
     <div class="card">
-        <div class="card-title">Profit</div>
+        <div class="card-title">Actual Profit</div>
         <div class="card-value {{ 'lime' if profit >= 0 else 'text-danger' }}">{{ fmt_gbp(profit) }}</div>
         {% if pallet.purchase_price_gbp > 0 %}
         <div class="card-subtitle">ROI: {{ "%.0f"|format((profit / pallet.purchase_price_gbp) * 100) }}%</div>
         {% endif %}
     </div>
 </div>
+
+{% if estimated_revenue > 0 %}
+<div class="stats-grid" style="margin-top:8px">
+    <div class="card" style="border-left:3px solid #f59e0b">
+        <div class="card-title" style="color:#f59e0b">Est. Revenue (if all sold)</div>
+        <div class="card-value" style="color:#f59e0b">{{ fmt_gbp(estimated_revenue) }}</div>
+        <div class="card-subtitle">Sum of all set prices</div>
+    </div>
+    <div class="card" style="border-left:3px solid #f59e0b">
+        <div class="card-title" style="color:#f59e0b">Est. Profit (after fees)</div>
+        <div class="card-value {{ 'lime' if estimated_profit >= 0 else 'text-danger' }}">{{ fmt_gbp(estimated_profit) }}</div>
+        <div class="card-subtitle">After eBay ~12.8% fee + cost</div>
+    </div>
+    <div class="card" style="border-left:3px solid #f59e0b">
+        <div class="card-title" style="color:#f59e0b">Est. ROI</div>
+        <div class="card-value {{ 'lime' if estimated_roi >= 0 else 'text-danger' }}">{{ "%.0f"|format(estimated_roi) }}%</div>
+        <div class="card-subtitle">{{ products_with_price }}/{{ stats.total }} products priced</div>
+    </div>
+</div>
+{% endif %}
 
 {% if pallet.notes %}
 <div class="card mb-16">
@@ -2039,11 +2059,24 @@ def pallet_detail(pallet_id):
 
     profit = (stats['revenue'] or 0) - (pallet['purchase_price_gbp'] or 0)
 
+    # Estimated revenue/profit from set prices
+    est = query_db("""
+        SELECT COALESCE(SUM(ebay_price_gbp * quantity), 0) as revenue,
+               COUNT(CASE WHEN ebay_price_gbp > 0 THEN 1 END) as priced
+        FROM products WHERE pallet_id = ? AND status IN ('warehouse', 'listed')
+    """, (pallet_id,), one=True)
+    estimated_revenue = est['revenue'] or 0
+    ebay_fee = estimated_revenue * 0.128  # ~12.8% eBay final value fee
+    estimated_profit = estimated_revenue - ebay_fee - (pallet['purchase_price_gbp'] or 0)
+    estimated_roi = (estimated_profit / (pallet['purchase_price_gbp'] or 1)) * 100 if pallet['purchase_price_gbp'] else 0
+
     return render_page(
         TEMPLATE_PALLET_DETAIL_CONTENT,
         page_title=f'{pallet["name"]} - eBay Hub UK',
         active_page='pallets',
-        pallet=pallet, products=products, stats=stats, profit=profit
+        pallet=pallet, products=products, stats=stats, profit=profit,
+        estimated_revenue=estimated_revenue, estimated_profit=estimated_profit,
+        estimated_roi=estimated_roi, products_with_price=est['priced'] or 0
     )
 
 
@@ -2369,12 +2402,44 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
             <button type="submit" class="btn btn-lime">
                 <span class="material-symbols-outlined">sell</span> List on eBay
             </button>
-            <button type="button" class="btn btn-outline btn-sm" disabled title="Coming soon">
+            <button type="button" class="btn btn-outline btn-sm" onclick="generateAI('title')" id="genTitleBtn">
                 <span class="material-symbols-outlined">auto_awesome</span> Generate Title
             </button>
-            <button type="button" class="btn btn-outline btn-sm" disabled title="Coming soon">
+            <button type="button" class="btn btn-outline btn-sm" onclick="generateAI('description')" id="genDescBtn">
                 <span class="material-symbols-outlined">auto_awesome</span> Generate Description
             </button>
+        </div>
+    </form>
+</div>
+<script>
+function generateAI(type) {
+    var btn = document.getElementById(type === 'title' ? 'genTitleBtn' : 'genDescBtn');
+    var oldText = btn.innerHTML;
+    btn.innerHTML = '<span class="material-symbols-outlined">hourglass_empty</span> Generating...';
+    btn.disabled = true;
+    var name = document.querySelector('[name="listing_title"]').value || '{{ product.name }}';
+    fetch('/api/generate-' + type, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({product_name: name, condition: '{{ product.condition }}'})
+    }).then(r => r.json()).then(d => {
+        if (d.ok) {
+            if (type === 'title') document.querySelector('[name="listing_title"]').value = d.text;
+            else document.querySelector('[name="description"]').value = d.text;
+            btn.innerHTML = '<span class="material-symbols-outlined">check</span> Done!';
+            setTimeout(() => { btn.innerHTML = oldText; btn.disabled = false; }, 2000);
+        } else {
+            alert('Error: ' + (d.error || 'AI generation failed'));
+            btn.innerHTML = oldText; btn.disabled = false;
+        }
+    }).catch(e => { alert('Error: ' + e); btn.innerHTML = oldText; btn.disabled = false; });
+}
+</script>
+<!-- Listings History -->
+{% if listings %}
+<div class="section-title">Listing History</div>
+<div class="table-wrap">
+    <table>
         </div>
     </form>
 </div>
@@ -2778,6 +2843,23 @@ TEMPLATE_SETTINGS_CONTENT = """
         </div>
     </div>
 
+    <!-- Gemini AI -->
+    <div class="card mb-16">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+            <span class="material-symbols-outlined" style="font-size:20px;color:#f59e0b">auto_awesome</span>
+            AI Title &amp; Description Generator
+        </div>
+        <p class="text-muted" style="font-size:0.85rem;margin:8px 0 16px 0;">
+            Uses Google Gemini AI to generate eBay titles and descriptions. Get your key from
+            <span class="text-cyan">aistudio.google.com</span>.
+        </p>
+        <div class="form-group">
+            <label class="form-label">Gemini API Key</label>
+            <input type="password" name="gemini_api_key" class="form-control"
+                   value="{{ config.gemini_api_key }}" placeholder="AIzaSy...">
+        </div>
+    </div>
+
     <!-- Telegram -->
     <div class="card mb-16">
         <div class="card-title" style="display:flex;align-items:center;gap:8px;">
@@ -2934,6 +3016,7 @@ def settings():
         keys = [
             'app_pin',
             'ebay_app_id', 'ebay_cert_id', 'ebay_dev_id', 'ebay_user_token',
+            'gemini_api_key',
             'telegram_bot_token', 'telegram_chat_id',
             'default_shipping', 'default_return_days'
         ]
@@ -3022,6 +3105,85 @@ def backup_upload():
     file.save(str(db_path))
     flash(f'Database restored from uploaded file: {file.filename}', 'success')
     return redirect(url_for('settings'))
+
+
+# ===================================================================
+# AI Generation (Gemini)
+# ===================================================================
+
+@app.route('/api/generate-title', methods=['POST'])
+def api_generate_title():
+    """Generate eBay-optimized title using Gemini AI."""
+    data = request.get_json() or {}
+    product_name = data.get('product_name', '')
+    if not product_name:
+        return jsonify({'ok': False, 'error': 'No product name'})
+
+    api_key = get_config('gemini_api_key', '')
+    if not api_key:
+        return jsonify({'ok': False, 'error': 'Gemini API key not set. Go to Settings.'})
+
+    try:
+        import requests as _req
+        resp = _req.post(
+            f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}',
+            json={
+                'contents': [{'parts': [{'text':
+                    f'Generate a concise eBay UK listing title (max 80 characters) for this product. '
+                    f'Include key specs and brand. No quotes, no special characters. English only.\n\n'
+                    f'Product: {product_name}\n\n'
+                    f'Return ONLY the title, nothing else.'
+                }]}]
+            },
+            timeout=15
+        )
+        result = resp.json()
+        text = result['candidates'][0]['content']['parts'][0]['text'].strip().strip('"\'')
+        return jsonify({'ok': True, 'text': text[:80]})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:100]})
+
+
+@app.route('/api/generate-description', methods=['POST'])
+def api_generate_description():
+    """Generate eBay product description using Gemini AI."""
+    data = request.get_json() or {}
+    product_name = data.get('product_name', '')
+    condition = data.get('condition', 'new')
+    if not product_name:
+        return jsonify({'ok': False, 'error': 'No product name'})
+
+    api_key = get_config('gemini_api_key', '')
+    if not api_key:
+        return jsonify({'ok': False, 'error': 'Gemini API key not set. Go to Settings.'})
+
+    try:
+        import requests as _req
+        resp = _req.post(
+            f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}',
+            json={
+                'contents': [{'parts': [{'text':
+                    f'Generate a professional eBay UK product description in HTML for this product. '
+                    f'Include: key features as bullet points, condition note, and a professional closing. '
+                    f'Use clean HTML (div, ul, li, p, strong tags). Keep it concise but informative. '
+                    f'English only. Do NOT include the title.\n\n'
+                    f'Product: {product_name}\n'
+                    f'Condition: {condition}\n\n'
+                    f'Return ONLY the HTML description, no markdown, no code blocks.'
+                }]}]
+            },
+            timeout=20
+        )
+        result = resp.json()
+        text = result['candidates'][0]['content']['parts'][0]['text'].strip()
+        # Remove markdown code blocks if present
+        if text.startswith('```'):
+            text = text.split('\n', 1)[1] if '\n' in text else text
+            if text.endswith('```'):
+                text = text[:-3]
+        return jsonify({'ok': True, 'text': text})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:100]})
 
 
 # ===================================================================
