@@ -199,8 +199,19 @@ class EbayAPI:
 
         # Build ItemSpecifics XML from dict
         item_specifics = product_data.get('item_specifics', {})
+        if not isinstance(item_specifics, dict):
+            item_specifics = {}
+        # Add required defaults if missing
+        if 'Type' not in item_specifics and 'type' not in item_specifics:
+            item_specifics['Type'] = 'Charger'
+        if 'Brand' not in item_specifics and 'brand' not in item_specifics:
+            # Try to extract brand from title
+            _title_words = title.split()
+            if _title_words:
+                item_specifics['Brand'] = _title_words[0]
+
         item_specifics_xml = ''
-        if item_specifics and isinstance(item_specifics, dict):
+        if item_specifics:
             nvl_parts = []
             for spec_name, spec_value in item_specifics.items():
                 if spec_name and spec_value:
