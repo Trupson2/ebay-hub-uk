@@ -3450,7 +3450,8 @@ def settings():
             'ebay_app_id', 'ebay_cert_id', 'ebay_dev_id', 'ebay_user_token',
             'gemini_api_key',
             'telegram_bot_token', 'telegram_chat_id',
-            'default_shipping', 'default_return_days'
+            'default_shipping', 'default_return_days',
+            'default_shipping_pricing', 'seller_postcode',
         ]
         for key in keys:
             val = request.form.get(key, '')
