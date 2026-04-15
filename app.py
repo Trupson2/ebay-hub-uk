@@ -318,8 +318,18 @@ def pallet_add():
     price = request.form.get('purchase_price_gbp', '0')
     date = request.form.get('purchase_date', '')
     notes = request.form.get('notes', '').strip()
+    amazon_domain = request.form.get('amazon_domain', '').strip()
     if not name:
         flash('Pallet name is required.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    # Validate Amazon domain — uncle MUST pick where supplier sourced ASINs
+    # from. Same ASIN on different locales = different product, so silently
+    # defaulting would pull wrong images/specs onto eBay listings.
+    from modules.scraper import AMAZON_DOMAINS
+    valid_domains = {d for d, _ in AMAZON_DOMAINS}
+    if amazon_domain not in valid_domains:
+        flash('Please pick an Amazon domain — this tells the scraper where to fetch product info from.', 'error')
         return redirect(url_for('pallets_list'))
 
     try:
@@ -328,9 +338,9 @@ def pallet_add():
         price = 0.0
 
     pallet_id = execute_db(
-        "INSERT INTO pallets (name, supplier, purchase_price_gbp, purchase_date, notes) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (name, supplier, price, date, notes)
+        "INSERT INTO pallets (name, supplier, purchase_price_gbp, purchase_date, notes, amazon_domain) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (name, supplier, price, date, notes, amazon_domain)
     )
 
     # Import products from uploaded CSV/XLSX file
@@ -412,10 +422,10 @@ def pallet_add():
 
                 image_url = get_amazon_image_url(asin) if asin else ''
 
-                # Auto-scrape Amazon UK
+                # Auto-scrape from the Amazon locale the uncle picked for this pallet
                 if asin:
                     try:
-                        data = scrape_amazon_product(asin)
+                        data = scrape_amazon_product(asin, amazon_domain)
                         if data:
                             if data.get('title') and len(data['title']) > len(prod_name):
                                 prod_name = data['title']
@@ -451,7 +461,7 @@ def pallet_add():
     if imported > 0:
         msg += f' Imported {imported} products'
         if scraped_cnt > 0:
-            msg += f' (scraped {scraped_cnt} from Amazon UK)'
+            msg += f' (scraped {scraped_cnt} from {amazon_domain})'
         msg += '.'
     msg += pipeline_msg
     flash(msg, 'success')
@@ -477,13 +487,39 @@ def pallet_archive(pallet_id):
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
+@app.route('/pallet/<int:pallet_id>/set-domain', methods=['POST'])
+def pallet_set_domain(pallet_id):
+    """Update which Amazon locale this pallet's ASINs belong to.
+    Validates against AMAZON_DOMAINS so only known hosts reach the scraper."""
+    pallet = query_db("SELECT id FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    from modules.scraper import AMAZON_DOMAINS
+    valid_domains = {d for d, _ in AMAZON_DOMAINS}
+    new_domain = request.form.get('amazon_domain', '').strip()
+    if new_domain not in valid_domains:
+        flash('Please pick a valid Amazon locale.', 'error')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    execute_db("UPDATE pallets SET amazon_domain = ? WHERE id = ?", (new_domain, pallet_id))
+    flash(f'Amazon locale set to {new_domain}. Re-scrape to refresh product info from this locale.', 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
 @app.route('/pallet/<int:pallet_id>/scrape', methods=['POST'])
 def pallet_scrape(pallet_id):
-    """Scrape Amazon UK for all products with ASINs but no image_url."""
+    """Scrape the pallet's Amazon locale for all products with ASINs."""
     pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
     if not pallet:
         flash('Pallet not found.', 'error')
         return redirect(url_for('pallets_list'))
+
+    domain = (pallet.get('amazon_domain') or '').strip()
+    if not domain:
+        flash('This pallet has no Amazon domain set. Edit the pallet and pick the locale the supplier sourced from.', 'error')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
     from modules.scraper import get_amazon_image_urls
     import requests as _req
@@ -499,8 +535,8 @@ def pallet_scrape(pallet_id):
 
     updated = 0
     for prod in products:
-        # Try scraping Amazon page first
-        amz_data = scrape_amazon_product(prod['asin'])
+        # Scrape from the pallet's configured Amazon locale — no cross-domain fallback
+        amz_data = scrape_amazon_product(prod['asin'], domain)
         if amz_data and amz_data.get('image_url'):
             new_name = amz_data.get('title') or prod['name']
             new_image = amz_data['image_url']
@@ -514,7 +550,7 @@ def pallet_scrape(pallet_id):
             )
             updated += 1
         else:
-            # Fallback: try multiple image URL formats
+            # Fallback: try multiple image URL formats (these are domain-agnostic media.amazon.com URLs)
             for url in get_amazon_image_urls(prod['asin']):
                 try:
                     r = _req.head(url, timeout=5, allow_redirects=True)
@@ -525,7 +561,7 @@ def pallet_scrape(pallet_id):
                 except:
                     continue
 
-    flash(f'Updated {updated}/{len(products)} products from Amazon UK.', 'success')
+    flash(f'Updated {updated}/{len(products)} products from {domain}.', 'success')
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
@@ -2206,9 +2242,29 @@ TEMPLATE_PALLETS_CONTENT = """
                     <input type="number" step="0.01" name="purchase_price_gbp" class="form-control" placeholder="0.00">
                 </div>
             </div>
-            <div class="form-group">
-                <label class="form-label">Purchase Date</label>
-                <input type="date" name="purchase_date" class="form-control">
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Purchase Date</label>
+                    <input type="date" name="purchase_date" class="form-control">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Amazon Domain *</label>
+                    <select name="amazon_domain" class="form-control" required>
+                        <option value="" disabled selected>-- Pick Amazon locale --</option>
+                        <option value="amazon.co.uk">Amazon.co.uk (UK)</option>
+                        <option value="amazon.de">Amazon.de (Germany)</option>
+                        <option value="amazon.com">Amazon.com (US)</option>
+                        <option value="amazon.pl">Amazon.pl (Poland)</option>
+                        <option value="amazon.fr">Amazon.fr (France)</option>
+                        <option value="amazon.it">Amazon.it (Italy)</option>
+                        <option value="amazon.es">Amazon.es (Spain)</option>
+                        <option value="amazon.nl">Amazon.nl (Netherlands)</option>
+                        <option value="amazon.se">Amazon.se (Sweden)</option>
+                    </select>
+                    <div style="font-size:0.7rem;color:var(--text-muted);margin-top:4px">
+                        Where the supplier sourced the ASINs. Same ASIN = different product on different locales.
+                    </div>
+                </div>
             </div>
             <div class="form-group">
                 <label class="form-label">Notes</label>
@@ -2217,7 +2273,7 @@ TEMPLATE_PALLETS_CONTENT = """
             <div style="border-top:1px solid rgba(255,255,255,0.08);padding-top:14px;margin-top:14px">
                 <label class="form-label"><span class="material-symbols-outlined" style="font-size:0.9rem;vertical-align:middle">upload_file</span> Import Specification (CSV / XLSX)</label>
                 <input type="file" name="spec_file" accept=".csv,.xlsx,.xls" class="form-control" style="padding:8px">
-                <div style="font-size:0.7rem;color:var(--text-muted);margin-top:4px">Upload supplier file with products. ASINs will be auto-scraped from Amazon UK.</div>
+                <div style="font-size:0.7rem;color:var(--text-muted);margin-top:4px">Upload supplier file with products. ASINs will be scraped from the Amazon locale you pick above (in English).</div>
             </div>
             <div class="d-flex gap-8" style="justify-content: flex-end; margin-top: 20px;">
                 <button type="button" class="btn btn-outline" onclick="document.getElementById('addPalletModal').classList.remove('active')">Cancel</button>
@@ -2349,6 +2405,37 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
     </div>
 </div>
 {% endif %}
+
+<!-- Amazon locale — scraper uses THIS domain for this pallet's ASINs.
+     Same ASIN on different locales = different product, so we keep it strict per-pallet. -->
+<div class="card mb-16" style="border-left:3px solid {% if pallet.amazon_domain %}#8ff5ff{% else %}#f59e0b{% endif %}">
+    <form method="POST" action="/pallet/{{ pallet.id }}/set-domain" class="d-flex" style="gap:12px;align-items:center;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+            <div style="font-size:0.75rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.5px">Amazon Locale</div>
+            <div style="font-size:1rem;font-weight:600;color:{% if pallet.amazon_domain %}#8ff5ff{% else %}#f59e0b{% endif %}">
+                {% if pallet.amazon_domain %}{{ pallet.amazon_domain }}{% else %}Not set — scraping disabled{% endif %}
+            </div>
+            <div style="font-size:0.7rem;color:var(--text-muted);margin-top:2px">
+                Scraper fetches product info (images, specs, title) from this Amazon locale in English.
+            </div>
+        </div>
+        <select name="amazon_domain" class="form-control" style="width:auto;min-width:180px">
+            <option value="" {% if not pallet.amazon_domain %}selected{% endif %} disabled>-- Pick locale --</option>
+            <option value="amazon.co.uk" {% if pallet.amazon_domain == 'amazon.co.uk' %}selected{% endif %}>Amazon.co.uk (UK)</option>
+            <option value="amazon.de" {% if pallet.amazon_domain == 'amazon.de' %}selected{% endif %}>Amazon.de (Germany)</option>
+            <option value="amazon.com" {% if pallet.amazon_domain == 'amazon.com' %}selected{% endif %}>Amazon.com (US)</option>
+            <option value="amazon.pl" {% if pallet.amazon_domain == 'amazon.pl' %}selected{% endif %}>Amazon.pl (Poland)</option>
+            <option value="amazon.fr" {% if pallet.amazon_domain == 'amazon.fr' %}selected{% endif %}>Amazon.fr (France)</option>
+            <option value="amazon.it" {% if pallet.amazon_domain == 'amazon.it' %}selected{% endif %}>Amazon.it (Italy)</option>
+            <option value="amazon.es" {% if pallet.amazon_domain == 'amazon.es' %}selected{% endif %}>Amazon.es (Spain)</option>
+            <option value="amazon.nl" {% if pallet.amazon_domain == 'amazon.nl' %}selected{% endif %}>Amazon.nl (Netherlands)</option>
+            <option value="amazon.se" {% if pallet.amazon_domain == 'amazon.se' %}selected{% endif %}>Amazon.se (Sweden)</option>
+        </select>
+        <button type="submit" class="btn btn-cyan btn-sm">
+            <span class="material-symbols-outlined">save</span> Save
+        </button>
+    </form>
+</div>
 
 {% if pallet.notes %}
 <div class="card mb-16">
@@ -2604,7 +2691,7 @@ TEMPLATE_CSV_IMPORT_CONTENT = """
         <div class="form-group" style="margin-top: 12px;">
             <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 0.85rem; color: var(--text-muted);">
                 <input type="checkbox" name="auto_scrape" value="1" checked style="accent-color: #8ff5ff;">
-                Auto-scrape Amazon UK for products with ASIN (images, titles, prices)
+                Auto-scrape {{ pallet.amazon_domain or '(no locale set!)' }} for products with ASIN (images, titles, prices)
             </label>
         </div>
         <div class="d-flex gap-8" style="margin-top: 20px;">
@@ -2632,6 +2719,12 @@ def csv_import(pallet_id):
 
         fname = file.filename.lower()
         auto_scrape = request.form.get('auto_scrape') == '1'
+        # Scraping needs a pallet locale — disable auto-scrape for legacy pallets
+        # that don't have amazon_domain set yet (uncle can set it from pallet page).
+        pallet_domain = (pallet.get('amazon_domain') or '').strip()
+        if auto_scrape and not pallet_domain:
+            auto_scrape = False
+            flash('Auto-scrape skipped: this pallet has no Amazon locale set. Edit the pallet to pick one, then re-scrape.', 'warning')
 
         try:
             rows = []
@@ -2724,10 +2817,10 @@ def csv_import(pallet_id):
 
                 image_url = get_amazon_image_url(asin) if asin else ''
 
-                # Auto-scrape Amazon UK for products with ASIN
+                # Auto-scrape the pallet's configured Amazon locale for products with ASIN
                 if auto_scrape and asin:
                     try:
-                        data = scrape_amazon_product(asin)
+                        data = scrape_amazon_product(asin, pallet_domain)
                         if data:
                             if data.get('title') and len(data['title']) > len(name):
                                 name = data['title']
@@ -2750,7 +2843,7 @@ def csv_import(pallet_id):
 
             msg = f'Imported {count} products'
             if scraped > 0:
-                msg += f' (scraped {scraped} from Amazon UK)'
+                msg += f' (scraped {scraped} from {pallet_domain})'
 
             # Run auto-pipeline (all images, AI titles/descriptions, drafts)
             if count > 0:
@@ -4054,7 +4147,7 @@ function setLang(lang) {
 <div class="card mb-16">
     <div class="card-title" style="color:#8ff5ff">Od czego zacząć — krok po kroku</div>
     <ol style="line-height:2.2;color:var(--text-muted);font-size:0.9rem">
-        <li><strong>Dodaj paletę:</strong> Wejdź w <strong>Pallets</strong> → <strong>+ Add Pallet</strong> → wpisz nazwę, cenę zakupu (GBP) i dostawcę. Wgraj plik CSV/XLSX/ODS od dostawcy palety.</li>
+        <li><strong>Dodaj paletę:</strong> Wejdź w <strong>Pallets</strong> → <strong>+ Add Pallet</strong> → wpisz nazwę, cenę zakupu (GBP) i dostawcę. <strong>Wybierz Amazon locale</strong> (tam skąd dostawca wziął ASINy — np. Amazon.de jeśli supplier z Niemiec). Wgraj plik CSV/XLSX/ODS od dostawcy palety.</li>
         <li><strong>Auto Pipeline:</strong> Na stronie palety kliknij <strong>Auto Pipeline</strong> — apka sama:
             <ul style="margin:4px 0 4px 20px;line-height:1.8">
                 <li>Pobierze do 8 zdjęć każdego produktu z Amazon UK</li>
@@ -4070,6 +4163,36 @@ function setLang(lang) {
         <li><strong>Wystaw:</strong> Wróć na paletę → kliknij <strong>Publish All</strong> → aukcje idą NA ŻYWO na eBay (zostaniesz zapytany o potwierdzenie).</li>
         <li><strong>Wyślij zamówienie:</strong> Gdy coś się sprzeda → <strong>Orders</strong> → <strong>Mark as Shipped</strong> + numer śledzenia.</li>
     </ol>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#8ff5ff">Amazon locale — dlaczego trzeba wybrać</div>
+    <p style="color:var(--text-muted);font-size:0.9rem;line-height:1.8">
+        Ten sam ASIN (np. <code>B07VB3BSD7</code>) może wskazywać na <strong>zupełnie inny produkt</strong>
+        na różnych Amazonach. Przykład: na <strong>amazon.co.uk</strong> to biała sztuczna choinka,
+        a na <strong>amazon.de</strong> ten sam kod ASIN to zielona choinka — i zielona właśnie jest w palecie.
+    </p>
+    <p style="color:var(--text-muted);font-size:0.9rem;line-height:1.8">
+        Dlatego <strong>każda paleta ma swój Amazon locale</strong> (wybierany przy <em>Add Pallet</em>
+        i można go zmienić na stronie palety). Scraper pobiera zdjęcia, opisy i specyfikację
+        <strong>wyłącznie</strong> z tego jednego locale — nie przeskakuje na inne, żeby nie pomieszać wariantów.
+    </p>
+    <ul style="color:var(--text-muted);font-size:0.85rem;line-height:2">
+        <li>Jak supplier jest z UK → wybierz <strong>Amazon.co.uk</strong></li>
+        <li>Jak supplier jest z Niemiec → wybierz <strong>Amazon.de</strong></li>
+        <li>Z Polski → <strong>Amazon.pl</strong>, z Francji → <strong>Amazon.fr</strong>, itd.</li>
+        <li>Nie wiesz? <strong>Zapytaj dostawcę</strong> — tylko on wie, z którego Amazona skompletował paletę</li>
+    </ul>
+    <p style="color:var(--text-muted);font-size:0.85rem;margin-top:8px">
+        <strong>Po angielsku i tak jest:</strong> nawet jak wybierzesz Amazon.de, apka pobiera stronę
+        w wersji angielskiej (URL <code>/-/en/</code>) — więc tytuły i bullet pointy zawsze są po angielsku
+        pod eBay UK. Bez tego dostawałbyś niemiecki tekst, bezużyteczny w aukcji.
+    </p>
+    <p style="color:var(--warning);font-size:0.85rem;margin-top:8px">
+        <strong>Uwaga:</strong> jeśli paleta nie ma locale → <strong>Auto Pipeline i Scrape Images nic nie zrobią</strong>
+        (nie chcemy zgadywać i wziąć złego wariantu). Zobaczysz żółty pasek „Not set" na stronie palety — kliknij
+        dropdown, wybierz locale, <strong>Save</strong>, i dopiero wtedy odpal pipeline.
+    </p>
 </div>
 
 <div class="card mb-16">
@@ -4188,7 +4311,7 @@ function setLang(lang) {
 <div class="card mb-16">
     <div class="card-title" style="color:#8ff5ff">Quick Start — The Easy Way</div>
     <ol style="line-height:2.2;color:var(--text-muted);font-size:0.9rem">
-        <li><strong>Add a pallet:</strong> Go to <strong>Pallets</strong> → <strong>+ Add Pallet</strong> → fill in name, price (GBP), supplier. Upload your CSV/XLSX/ODS file from the joblot supplier.</li>
+        <li><strong>Add a pallet:</strong> Go to <strong>Pallets</strong> → <strong>+ Add Pallet</strong> → fill in name, price (GBP), supplier. <strong>Pick the Amazon locale</strong> (where the supplier sourced the ASINs from — e.g. Amazon.de if the supplier is German). Upload your CSV/XLSX/ODS file from the joblot supplier.</li>
         <li><strong>Auto Pipeline:</strong> Click <strong>Auto Pipeline</strong> on the pallet page → the app automatically:
             <ul style="margin:4px 0 4px 20px;line-height:1.8">
                 <li>Downloads up to 8 product images from Amazon UK</li>
@@ -4204,6 +4327,38 @@ function setLang(lang) {
         <li><strong>Publish:</strong> Go back to the pallet → click <strong>Publish All</strong> → listings go LIVE on eBay (you'll be asked to confirm).</li>
         <li><strong>Ship orders:</strong> When something sells → go to <strong>Orders</strong> → click <strong>Mark as Shipped</strong> with the tracking number.</li>
     </ol>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#8ff5ff">Amazon locale — why you must pick one</div>
+    <p style="color:var(--text-muted);font-size:0.9rem;line-height:1.8">
+        The same ASIN (e.g. <code>B07VB3BSD7</code>) can point to a <strong>completely different product</strong>
+        on different Amazon locales. Real example: on <strong>amazon.co.uk</strong> this ASIN is a white artificial
+        Christmas tree; on <strong>amazon.de</strong> the same ASIN is a green tree — and the green one is what's
+        actually in the pallet.
+    </p>
+    <p style="color:var(--text-muted);font-size:0.9rem;line-height:1.8">
+        That's why <strong>every pallet has its own Amazon locale</strong> (picked during <em>Add Pallet</em>,
+        editable later from the pallet page). The scraper fetches images, descriptions, and specifications
+        <strong>only</strong> from that single locale — it never falls back to other domains, to avoid mixing
+        variants.
+    </p>
+    <ul style="color:var(--text-muted);font-size:0.85rem;line-height:2">
+        <li>Supplier from UK → pick <strong>Amazon.co.uk</strong></li>
+        <li>Supplier from Germany → pick <strong>Amazon.de</strong></li>
+        <li>Poland → <strong>Amazon.pl</strong>, France → <strong>Amazon.fr</strong>, etc.</li>
+        <li>Not sure? <strong>Ask the supplier</strong> — only they know which Amazon they built the pallet from</li>
+    </ul>
+    <p style="color:var(--text-muted);font-size:0.85rem;margin-top:8px">
+        <strong>It's still in English:</strong> even if you pick Amazon.de, the app fetches the page in
+        English (via Amazon's <code>/-/en/</code> URL prefix) — so titles and bullet points are always in English,
+        ready for your eBay UK listing. Without this you'd get German text, useless on the listing.
+    </p>
+    <p style="color:var(--warning);font-size:0.85rem;margin-top:8px">
+        <strong>Important:</strong> if a pallet has no locale set → <strong>Auto Pipeline and Scrape Images skip it</strong>
+        (we'd rather have no data than the wrong variant). You'll see a yellow "Not set" banner on the pallet
+        page — use the dropdown, pick a locale, hit <strong>Save</strong>, then run the pipeline.
+    </p>
 </div>
 
 <div class="card mb-16">
@@ -4363,12 +4518,14 @@ def _gemini_call(api_key, prompt, timeout=15):
 def auto_process_products(pallet_id):
     """
     Auto-pipeline: After CSV import, process each product:
-    1. Scrape Amazon for all images + item specifics
+    1. Scrape the pallet's Amazon locale for all images + item specifics
     2. Generate eBay-optimized title via Gemini
     3. Generate HTML description via Gemini
     4. Match eBay category via Gemini
     5. Create draft listing with all data
     """
+    pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True) or {}
+    pallet_domain = (pallet.get('amazon_domain') or '').strip()
     products = query_db("SELECT * FROM products WHERE pallet_id = ?", (pallet_id,))
     gemini_key = get_config('gemini_api_key', '')
 
@@ -4382,10 +4539,12 @@ def auto_process_products(pallet_id):
         item_specifics = {}
         bullet_points = []
 
-        # --- Step 1: Scrape Amazon (all images + item specifics) ---
-        if product['asin']:
+        # --- Step 1: Scrape the pallet's Amazon locale (all images + item specifics) ---
+        # Skip scraping if the pallet has no locale set — same-ASIN-different-product
+        # risk means we'd rather have no data than wrong data.
+        if product['asin'] and pallet_domain:
             try:
-                data = scrape_amazon_product(product['asin'])
+                data = scrape_amazon_product(product['asin'], pallet_domain)
                 if data:
                     all_images = data.get('all_images', [])
                     item_specifics = data.get('item_specifics', {})

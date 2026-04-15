@@ -136,6 +136,14 @@ def init_db():
         # needs to count toward his revenue and profit on the dashboard.
         ('sales', 'source', "TEXT DEFAULT 'ebay'"),
         ('sales', 'notes', "TEXT DEFAULT ''"),
+        # pallets.amazon_domain: which Amazon locale this pallet's ASINs belong
+        # to. The SAME ASIN can point to different products across locales
+        # (e.g. on .co.uk it's a white Christmas tree, on .de it's the green
+        # one uncle actually got) — so the scraper MUST be told which locale
+        # the supplier sourced from, otherwise we pull images/specs for a
+        # completely different product. No default — the uncle picks per-pallet
+        # when adding the pallet (empty = scraping blocked until set).
+        ('pallets', 'amazon_domain', "TEXT DEFAULT ''"),
     ]
     for table, col, col_type in _migrations:
         try:

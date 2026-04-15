@@ -1,6 +1,8 @@
 """
 eBay Hub UK - Amazon Product Scraper & Specification Parser
-Scrapes product data from Amazon UK (priority), then .com, then .de.
+Scrapes product data from a single, pallet-configured Amazon locale.
+The same ASIN can mean different products on different locales, so we
+never fall back across domains — the caller (pallet record) picks one.
 Parses pasted joblot specification text to extract product info.
 """
 
@@ -318,82 +320,105 @@ def _extract_category(soup):
     return ''
 
 
-def scrape_amazon_product(asin):
+def scrape_amazon_product(asin, domain):
     """
-    Scrape product data from Amazon for a given ASIN.
-    Tries amazon.co.uk first, then .com, then .de.
+    Scrape product data from Amazon for a given ASIN from a SPECIFIC domain.
 
-    Returns dict: {title, image_url, price, bullet_points, category}
-    or None on failure.
+    Important: the same ASIN can point to a totally different product on
+    different Amazon locales (e.g. on .co.uk it's a green item, on .de it's
+    a blue one). We deliberately do NOT fall back to other domains — that
+    would mix images/specs from a different product and mislead the uncle
+    when listing on eBay. If the given domain doesn't have the ASIN or
+    throws CAPTCHA, we return None so the caller can show the error.
+
+    `domain` is REQUIRED — no default. It comes from the pallet's
+    amazon_domain config (uncle picks it when adding the pallet based on
+    where the supplier sourced from). Must be one of AMAZON_DOMAINS.
+
+    Returns dict: {title, image_url, price, bullet_points, category,
+    all_images, item_specifics, source_domain} or None on failure.
     """
     if not asin or not ASIN_RE.match(asin):
         logger.warning(f"Invalid ASIN: {asin}")
         return None
 
+    # Sanity-check the requested domain — if someone passes a typo, an
+    # unknown host, or nothing at all, bail rather than silently hitting
+    # a random URL or picking a wrong domain for the uncle.
+    valid_domains = {d for d, _ in AMAZON_DOMAINS}
+    if not domain or domain not in valid_domains:
+        logger.warning(f"Missing/unknown Amazon domain '{domain}' for {asin} — caller must pass pallet.amazon_domain")
+        return None
+
     session = _create_session()
-
-    for domain, currency in AMAZON_DOMAINS:
+    # Amazon respects a /-/en/ path prefix on non-English locales — it forces
+    # the product page to render in English even on .de/.fr/.it/etc. This is
+    # the exact URL shape the user pastes into their browser when checking
+    # a supplier's ASIN (e.g. https://www.amazon.de/-/en/.../dp/ASIN). Without
+    # this, scraping .de gives us German titles/bullets that are useless for
+    # an English eBay UK listing.
+    if domain in ('amazon.co.uk', 'amazon.com'):
         url = f"https://www.{domain}/dp/{asin}"
+    else:
+        url = f"https://www.{domain}/-/en/dp/{asin}"
+
+    try:
+        # Random delay to look less bot-like
+        time.sleep(random.uniform(1.5, 3.5))
+
+        # Visit domain homepage first so we have its cookies
         try:
-            # Random delay to avoid rate limiting
-            time.sleep(random.uniform(1.5, 3.5))
+            session.get(f"https://www.{domain}/ref=cs_503_link", timeout=8, allow_redirects=True)
+        except:
+            pass
 
-            # Visit domain homepage first for cookies
-            try:
-                session.get(f"https://www.{domain}/ref=cs_503_link", timeout=8, allow_redirects=True)
-            except:
-                pass
+        resp = session.get(url, timeout=15, allow_redirects=True)
 
-            resp = session.get(url, timeout=15, allow_redirects=True)
+        if resp.status_code == 503 or 'captcha' in resp.text.lower() or 'robot check' in resp.text.lower():
+            logger.warning(f"[SCRAPE] CAPTCHA on {domain} for {asin}")
+            return None
 
-            if resp.status_code == 503 or 'captcha' in resp.text.lower() or 'robot check' in resp.text.lower():
-                print(f"[SCRAPE] CAPTCHA on {domain} for {asin}, trying next...")
-                time.sleep(2)
-                continue
+        if resp.status_code != 200:
+            logger.warning(f"[SCRAPE] HTTP {resp.status_code} from {domain} for {asin}")
+            return None
 
-            if resp.status_code != 200:
-                print(f"[SCRAPE] HTTP {resp.status_code} from {domain} for {asin}")
-                time.sleep(1)
-                continue
+        soup = BeautifulSoup(resp.text, 'html.parser')
 
-            soup = BeautifulSoup(resp.text, 'html.parser')
+        title = _extract_title(soup)
+        if not title:
+            logger.warning(f"No title found on {domain} for {asin} — not listed on this locale")
+            return None
 
-            title = _extract_title(soup)
-            if not title:
-                logger.warning(f"No title found on {domain} for {asin}, trying next")
-                time.sleep(0.5)
-                continue
+        image_url = _extract_image(soup) or get_amazon_image_url(asin)
+        price = _extract_price(soup)
+        bullet_points = _extract_bullet_points(soup)
+        category = _extract_category(soup)
+        all_images = _extract_all_images(soup, page_text=resp.text, asin=asin)
+        item_specifics = _extract_item_specifics(soup)
 
-            image_url = _extract_image(soup) or get_amazon_image_url(asin)
-            price = _extract_price(soup)
-            bullet_points = _extract_bullet_points(soup)
-            category = _extract_category(soup)
-            all_images = _extract_all_images(soup, page_text=resp.text, asin=asin)
-            item_specifics = _extract_item_specifics(soup)
+        # Ensure main image is first in all_images
+        if image_url and image_url not in all_images:
+            all_images.insert(0, image_url)
+        all_images = all_images[:8]
 
-            # Ensure main image is first in all_images
-            if image_url and image_url not in all_images:
-                all_images.insert(0, image_url)
-            all_images = all_images[:8]
+        logger.info(
+            f"[SCRAPE] {asin} from {domain}: {title[:50]}... "
+            f"({len(all_images)} images, {len(item_specifics)} specs)"
+        )
+        return {
+            'title': title,
+            'image_url': image_url,
+            'price': price,
+            'bullet_points': bullet_points,
+            'category': category,
+            'all_images': all_images,
+            'item_specifics': item_specifics,
+            'source_domain': domain,
+        }
 
-            logger.info(f"Scraped {asin} from {domain}: {title[:50]}... ({len(all_images)} images, {len(item_specifics)} specs)")
-            return {
-                'title': title,
-                'image_url': image_url,
-                'price': price,
-                'bullet_points': bullet_points,
-                'category': category,
-                'all_images': all_images,
-                'item_specifics': item_specifics,
-            }
-
-        except requests.RequestException as e:
-            logger.warning(f"Request failed for {domain}/{asin}: {e}")
-            time.sleep(0.5)
-            continue
-
-    logger.error(f"All Amazon domains failed for ASIN: {asin}")
-    return None
+    except requests.RequestException as e:
+        logger.warning(f"Request failed for {domain}/{asin}: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
