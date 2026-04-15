@@ -448,7 +448,12 @@ class EbayAPI:
                   only). Falls back to flat if prerequisites missing.
                 - origin_postcode: str (seller's postcode, required for calculated)
                 - weight_kg, length_cm, width_cm, height_cm: float (required for calculated)
-                - return_days: int (default 30)
+                - return_days: int (default 30) — legacy, ignored when returns_policy is set
+                - returns_policy: str (default 'no') — one of:
+                    'no' -> ReturnsNotAccepted (private sellers, no refund for change of mind)
+                    '14' / '30' / '60' -> ReturnsAccepted + that many days
+                    Note: eBay Money Back Guarantee still protects buyers for
+                    "not received" / "not as described" regardless of this.
                 - item_specifics: dict (optional, key-value pairs for eBay ItemSpecifics)
 
         Returns:
@@ -467,6 +472,29 @@ class EbayAPI:
         return_days = product_data.get('return_days', 30)
 
         condition_id = CONDITION_MAP.get(condition, '3000')
+
+        # Return policy: 'no' (ReturnsNotAccepted) or a day count as string
+        # ('14', '30', '60'). Defaults to 'no' — private sellers on eBay UK
+        # are not legally required to accept returns for change of mind.
+        returns_policy = str(product_data.get('returns_policy') or 'no').strip().lower()
+        if returns_policy == 'no':
+            return_policy_xml = (
+                '<ReturnPolicy>'
+                '<ReturnsAcceptedOption>ReturnsNotAccepted</ReturnsAcceptedOption>'
+                '</ReturnPolicy>'
+            )
+        else:
+            # Extract digits; fall back to 30 if not recognised.
+            days_str = ''.join(c for c in returns_policy if c.isdigit()) or '30'
+            if days_str not in ('14', '30', '60'):
+                days_str = '30'
+            return_policy_xml = (
+                '<ReturnPolicy>'
+                '<ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>'
+                f'<ReturnsWithinOption>Days_{days_str}</ReturnsWithinOption>'
+                '</ReturnPolicy>'
+            )
+        print(f"[eBay API] Returns: {returns_policy}")
 
         # Shipping — resolve method, pricing mode, and build the right XML block.
         method = get_shipping_method(shipping_key)
@@ -612,10 +640,7 @@ class EbayAPI:
         </PictureDetails>
         {product_listing_details}
         {item_specifics_xml}
-        <ReturnPolicy>
-            <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
-            <ReturnsWithinOption>Days_30</ReturnsWithinOption>
-        </ReturnPolicy>
+        {return_policy_xml}
         {shipping_details_xml}
         <Site>UK</Site>
     </Item>

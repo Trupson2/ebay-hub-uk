@@ -627,6 +627,7 @@ def pallet_publish_all(pallet_id):
     return_days = int(get_config('default_return_days', '30') or '30')
     default_pricing = get_config('default_shipping_pricing', 'flat') or 'flat'
     origin_postcode = get_config('seller_postcode', '')
+    returns_policy = get_config('returns_policy', 'no') or 'no'
 
     published = 0
     failed = 0
@@ -697,6 +698,7 @@ def pallet_publish_all(pallet_id):
                 'width_cm': draft.get('width_cm'),
                 'height_cm': draft.get('height_cm'),
                 'return_days': return_days,
+                'returns_policy': returns_policy,
             })
 
             if result and result.get('success'):
@@ -897,6 +899,7 @@ def list_on_ebay(product_id):
         or get_config('default_shipping_pricing', 'flat') or 'flat'
     origin_postcode = get_config('seller_postcode', '')
     return_days = int(get_config('default_return_days', '30') or '30')
+    returns_policy = get_config('returns_policy', 'no') or 'no'
     cat = (product.get('category') or '175673').split(':')[0]
 
     # Validate product fits the shipping method (weight + dimensions).
@@ -949,6 +952,7 @@ def list_on_ebay(product_id):
         'width_cm': product.get('width_cm'),
         'height_cm': product.get('height_cm'),
         'return_days': return_days,
+        'returns_policy': returns_policy,
         'item_specifics': prod_specs,
     })
     if result and result.get('success'):
@@ -3333,10 +3337,18 @@ TEMPLATE_SETTINGS_CONTENT = """
                 </select>
             </div>
             <div class="form-group">
-                <label class="form-label">Default Return Policy (days)</label>
-                <input type="number" name="default_return_days" class="form-control"
-                       value="{{ config.default_return_days or '30' }}" min="0">
-                <div class="form-hint">eBay UK requires minimum 14 days for consumer sales</div>
+                <label class="form-label">Returns Policy</label>
+                <select name="returns_policy" class="form-control">
+                    <option value="no" {{ 'selected' if (config.returns_policy or 'no') == 'no' }}>No returns accepted (private seller)</option>
+                    <option value="14" {{ 'selected' if config.returns_policy == '14' }}>14 days</option>
+                    <option value="30" {{ 'selected' if config.returns_policy == '30' }}>30 days</option>
+                    <option value="60" {{ 'selected' if config.returns_policy == '60' }}>60 days</option>
+                </select>
+                <div class="form-hint">
+                    <strong>No returns</strong> — OK dla <em>private seller</em> (wujek nie ma firmy). Kupujący nie zwróci bo mu się odwidziało.<br>
+                    <strong>Business seller</strong> (zarejestrowana firma na eBay) musi dać ≥14 dni.<br>
+                    <em>Uwaga:</em> eBay Money Back Guarantee i tak wymusi zwrot jeśli towar uszkodzony / nie zgadza się z opisem.
+                </div>
             </div>
         </div>
         <div class="form-row">
@@ -3452,6 +3464,7 @@ def settings():
             'telegram_bot_token', 'telegram_chat_id',
             'default_shipping', 'default_return_days',
             'default_shipping_pricing', 'seller_postcode',
+            'returns_policy',
         ]
         for key in keys:
             val = request.form.get(key, '')
@@ -3467,6 +3480,7 @@ def settings():
         'telegram_bot_token', 'telegram_chat_id',
         'default_shipping', 'default_return_days',
         'default_shipping_pricing', 'seller_postcode',
+        'returns_policy',
     ]
     for key in keys:
         config[key] = get_config(key, '')
