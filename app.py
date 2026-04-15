@@ -458,8 +458,21 @@ def pallet_add():
                     try:
                         data = scrape_amazon_product(asin, amazon_domain or None)
                         if data:
-                            if data.get('title') and len(data['title']) > len(prod_name):
-                                prod_name = data['title']
+                            # Prefer the scraped title over the CSV name whenever
+                            # the scraped one is English. The uncle sells on eBay
+                            # UK and does NOT want to hand-translate every row, so
+                            # a 20-char English title from Amazon beats an 80-char
+                            # Polish title from the supplier's CSV every time.
+                            scraped_title = data.get('title') or ''
+                            csv_looks_pl = any(c.isalpha() and ord(c) > 127 for c in prod_name)
+                            if scraped_title:
+                                scraped_is_english = not any(
+                                    c.isalpha() and ord(c) > 127 for c in scraped_title
+                                )
+                                # Replace if: scraped is English, OR CSV is non-English
+                                # and scraped is at least as good, OR CSV is empty.
+                                if scraped_is_english or csv_looks_pl or not prod_name:
+                                    prod_name = scraped_title
                             if data.get('image_url'):
                                 image_url = data['image_url']
                             if data.get('price') and ebay_price == 0:
@@ -691,33 +704,31 @@ def _run_pallet_scrape(pallet_id, override):
     import requests as _req
 
     try:
-        # Skip products that already have an image. The uncle asked for this
-        # explicitly — once a product is scraped successfully there's no
-        # point hitting Amazon again (wastes time and bumps into CAPTCHA
-        # faster). A product counts as "already has image" if image_url is
-        # set OR its images JSON gallery has at least one entry. If the user
-        # wants to force a re-scrape they can clear image_url from the
-        # product edit page first.
-        products = query_db(
-            "SELECT * FROM products "
-            "WHERE pallet_id = ? AND asin != '' "
-            "  AND (image_url IS NULL OR image_url = '') "
-            "  AND (images IS NULL OR images = '' OR images = '[]')",
+        # Products with ASIN — we filter in Python because SQLite can't
+        # natively detect non-ASCII chars in the title efficiently, and
+        # we want to treat a Polish/German title as "still needs work"
+        # even if the image is already scraped.
+        all_products = query_db(
+            "SELECT * FROM products WHERE pallet_id = ? AND asin != ''",
             (pallet_id,)
         )
-        total_pending = len(products)
 
-        # Include already-scraped count in the progress denominator so the
-        # bar reads "47 / 50" instead of "3 / 3" for a mostly-done pallet.
-        already = query_db(
-            "SELECT COUNT(*) AS c FROM products "
-            "WHERE pallet_id = ? AND asin != '' "
-            "  AND ((image_url IS NOT NULL AND image_url <> '') "
-            "       OR (images IS NOT NULL AND images <> '' AND images <> '[]'))",
-            (pallet_id,), one=True
-        )
-        already_cnt = (already['c'] if already else 0)
-        total_display = total_pending + already_cnt
+        def _needs_work(p):
+            has_image = (
+                (p.get('image_url') or '').strip()
+                or (p.get('images') or '').strip() not in ('', '[]')
+            )
+            non_english_title = any(
+                c.isalpha() and ord(c) > 127 for c in (p.get('name') or '')
+            )
+            # Work to do if: no image at all, OR title is still non-English
+            # (we upgrade those to English via amazon.co.uk — see scraper).
+            return (not has_image) or non_english_title
+
+        products = [p for p in all_products if _needs_work(p)]
+        total_pending = len(products)
+        already_cnt = len(all_products) - total_pending
+        total_display = len(all_products)
 
         with _scrape_lock:
             _scrape_jobs[pallet_id]['total'] = total_display
@@ -741,6 +752,14 @@ def _run_pallet_scrape(pallet_id, override):
         effective_override = override
 
         for i, prod in enumerate(products):
+            # Classify what this product needs. A product that only needs a
+            # title upgrade should NOT have its images/price/specs rewritten
+            # — those were scraped successfully before and the user might
+            # have customised them.
+            has_image = (
+                (prod.get('image_url') or '').strip()
+                or (prod.get('images') or '').strip() not in ('', '[]')
+            )
             try:
                 amz_data = scrape_amazon_product(prod['asin'], effective_override)
             except Exception:
@@ -748,22 +767,36 @@ def _run_pallet_scrape(pallet_id, override):
 
             if amz_data and amz_data.get('image_url'):
                 new_name = amz_data.get('title') or prod['name']
-                new_image = amz_data['image_url']
-                new_price = amz_data.get('price') or prod['ebay_price_gbp']
-                images_json = json.dumps(amz_data.get('all_images', []))
-                specs_json = json.dumps(amz_data.get('item_specifics', {}))
-                execute_db(
-                    "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ?, images = ?, item_specifics = ? WHERE id = ?",
-                    (new_name, new_image, new_price, images_json, specs_json, prod['id'])
-                )
-                updated += 1
+
+                if has_image:
+                    # Title-only upgrade — don't touch images/price/specs.
+                    if new_name and new_name != prod['name']:
+                        execute_db(
+                            "UPDATE products SET name = ? WHERE id = ?",
+                            (new_name, prod['id'])
+                        )
+                        updated += 1
+                else:
+                    # Full scrape (had no image before).
+                    new_image = amz_data['image_url']
+                    new_price = amz_data.get('price') or prod['ebay_price_gbp']
+                    images_json = json.dumps(amz_data.get('all_images', []))
+                    specs_json = json.dumps(amz_data.get('item_specifics', {}))
+                    execute_db(
+                        "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ?, images = ?, item_specifics = ? WHERE id = ?",
+                        (new_name, new_image, new_price, images_json, specs_json, prod['id'])
+                    )
+                    updated += 1
+
                 if not detected_domain:
                     detected_domain = amz_data.get('source_domain')
                     # Re-use the detected locale for remaining products
                     if not effective_override and detected_domain:
                         effective_override = detected_domain
-            else:
-                # Fallback: try static media.amazon.com image URLs (domain-agnostic)
+            elif not has_image:
+                # Fallback: try static media.amazon.com image URLs (domain-agnostic).
+                # Skip entirely for title-only upgrades — the product already
+                # has a valid image, don't replace it with a HEAD-checked guess.
                 for url in get_amazon_image_urls(prod['asin']):
                     try:
                         r = _req.head(url, timeout=5, allow_redirects=True)
@@ -3280,8 +3313,15 @@ def csv_import(pallet_id):
                     try:
                         data = scrape_amazon_product(asin, pallet_domain or None)
                         if data:
-                            if data.get('title') and len(data['title']) > len(name):
-                                name = data['title']
+                            # Prefer scraped title if English (or if CSV was non-English)
+                            scraped_title = data.get('title') or ''
+                            csv_looks_pl = any(c.isalpha() and ord(c) > 127 for c in (name or ''))
+                            if scraped_title:
+                                scraped_is_english = not any(
+                                    c.isalpha() and ord(c) > 127 for c in scraped_title
+                                )
+                                if scraped_is_english or csv_looks_pl or not name:
+                                    name = scraped_title
                             if data.get('image_url'):
                                 image_url = data['image_url']
                             if data.get('price') and price == 0:
@@ -5026,11 +5066,20 @@ def auto_process_products(pallet_id):
                         execute_db("UPDATE products SET image_url=? WHERE id=?",
                                    (data['image_url'], pid))
 
-                    # Update name if Amazon title is better
-                    if data.get('title') and len(data['title']) > len(product_name):
-                        product_name = data['title']
-                        execute_db("UPDATE products SET name=? WHERE id=?",
-                                   (product_name, pid))
+                    # Update name: prefer scraped English title over the
+                    # supplier CSV name (which is often long + Polish). We
+                    # only keep the existing name if the scraped one is
+                    # non-English AND the existing one was already English.
+                    scraped_title = data.get('title') or ''
+                    if scraped_title:
+                        existing_is_pl = any(c.isalpha() and ord(c) > 127 for c in (product_name or ''))
+                        scraped_is_english = not any(
+                            c.isalpha() and ord(c) > 127 for c in scraped_title
+                        )
+                        if scraped_is_english or existing_is_pl or not product_name:
+                            product_name = scraped_title
+                            execute_db("UPDATE products SET name=? WHERE id=?",
+                                       (product_name, pid))
 
                     # Update price if we have none
                     if data.get('price') and (product['ebay_price_gbp'] or 0) == 0:

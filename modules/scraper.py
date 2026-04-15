@@ -56,6 +56,21 @@ HEADERS = {
 # ASIN pattern: starts with B0 followed by 8 alphanumeric chars
 ASIN_RE = re.compile(r'\b(B0[A-Z0-9]{8})\b')
 
+
+def _looks_non_english(text):
+    """Detect titles that contain accented letters from Polish, German,
+    French, Italian, Swedish, etc. Those products came from a non-English
+    locale where Amazon's /-/en/ prefix didn't have a translation. We then
+    re-scrape the title from amazon.co.uk/amazon.com so the uncle's eBay
+    listings go out in English without him having to edit every title.
+    Pure ASCII titles with just weird punctuation (®, ™, ", etc.) do NOT
+    count as non-English — those are fine for English listings."""
+    if not text:
+        return False
+    # Any alphabetic character with a codepoint above 127 means non-ASCII
+    # script: ą/ä/é/ü/ö/ß/ñ/å etc.
+    return any(c.isalpha() and ord(c) > 127 for c in text)
+
 # EAN pattern: 13-digit number (also catches UPC-A 12-digit if needed)
 EAN_RE = re.compile(r'\b(\d{13})\b')
 
@@ -517,6 +532,26 @@ def scrape_amazon_product(asin, domain=None, strict=False):
                 logger.info(f"[SCRAPE] {asin} not on hint {domain}, fell back to {d}")
             else:
                 logger.info(f"[SCRAPE] Auto-detected {asin} on {d}")
+
+            # Title upgrade: if the title came back in Polish/German/etc,
+            # try amazon.co.uk or amazon.com for just the title so the
+            # uncle's listings are English. We keep images/specs/price from
+            # the original scrape because the ASIN might map to a different
+            # variant per locale (see the Busybee Christmas Tree case).
+            if _looks_non_english(result.get('title', '')) and d not in ('amazon.co.uk', 'amazon.com'):
+                for eng_domain in ('amazon.co.uk', 'amazon.com'):
+                    eng_result = _scrape_single_domain(asin, eng_domain, session=session)
+                    if eng_result and eng_result.get('title') and not _looks_non_english(eng_result['title']):
+                        logger.info(
+                            f"[SCRAPE] Upgraded {asin} title from {d} ({result['title'][:40]}...) "
+                            f"to {eng_domain} ({eng_result['title'][:40]}...)"
+                        )
+                        result['title'] = eng_result['title']
+                        # Bullets are also often in the local language — upgrade
+                        # those too if the English locale had them.
+                        if eng_result.get('bullet_points'):
+                            result['bullet_points'] = eng_result['bullet_points']
+                        break
             return result
 
     logger.warning(f"[SCRAPE] {asin} not found on any Amazon locale")
