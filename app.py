@@ -596,6 +596,40 @@ def pallets_merge_duplicates():
     return redirect(url_for('pallets_list'))
 
 
+@app.route('/pallet/<int:pallet_id>/edit', methods=['POST'])
+def pallet_edit(pallet_id):
+    """Edit the pallet's metadata (name, supplier, purchase price, date, notes).
+    Before this existed the only way to fix a wrong price was to delete the
+    pallet + products and re-upload the CSV, which was brutal."""
+    pallet = query_db("SELECT id FROM pallets WHERE id = ?", (pallet_id,), one=True)
+    if not pallet:
+        flash('Pallet not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    name = request.form.get('name', '').strip()
+    supplier = request.form.get('supplier', '').strip()
+    price_raw = request.form.get('purchase_price_gbp', '0')
+    date = request.form.get('purchase_date', '').strip()
+    notes = request.form.get('notes', '').strip()
+
+    if not name:
+        flash('Pallet name is required.', 'error')
+        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+    try:
+        price = float(price_raw)
+    except (ValueError, TypeError):
+        price = 0.0
+
+    execute_db(
+        "UPDATE pallets SET name = ?, supplier = ?, purchase_price_gbp = ?, "
+        "purchase_date = ?, notes = ? WHERE id = ?",
+        (name, supplier, price, date, notes, pallet_id)
+    )
+    flash('Pallet updated.', 'success')
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
 @app.route('/pallet/<int:pallet_id>/archive', methods=['POST'])
 def pallet_archive(pallet_id):
     execute_db("UPDATE pallets SET status = 'archived' WHERE id = ?", (pallet_id,))
@@ -2647,6 +2681,9 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
                 <span class="material-symbols-outlined">photo_camera</span> Scrape Images
             </button>
         </form>
+        <button type="button" class="btn btn-outline btn-sm" onclick="document.getElementById('editPalletModal').classList.add('active')">
+            <span class="material-symbols-outlined">edit</span> Edit
+        </button>
         <form method="POST" action="/pallet/{{ pallet.id }}/archive" class="inline-form">
             <button type="submit" class="btn btn-outline btn-sm">
                 <span class="material-symbols-outlined">archive</span> Archive
@@ -2656,6 +2693,44 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
             <button type="submit" class="btn btn-sm" style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#ef4444">
                 <span class="material-symbols-outlined">delete</span> Delete
             </button>
+        </form>
+    </div>
+</div>
+
+<!-- Edit Pallet Modal — name / supplier / purchase price / date / notes -->
+<div id="editPalletModal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('active')">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h2>Edit Pallet</h2>
+            <button class="modal-close" onclick="document.getElementById('editPalletModal').classList.remove('active')">&times;</button>
+        </div>
+        <form method="POST" action="/pallet/{{ pallet.id }}/edit">
+            <div class="form-group">
+                <label>Pallet Name *</label>
+                <input type="text" name="name" class="form-control" required value="{{ pallet.name or '' }}">
+            </div>
+            <div class="form-group">
+                <label>Supplier</label>
+                <input type="text" name="supplier" class="form-control" value="{{ pallet.supplier or '' }}">
+            </div>
+            <div class="form-group">
+                <label>Purchase Price (&pound;)</label>
+                <input type="number" step="0.01" min="0" name="purchase_price_gbp" class="form-control" value="{{ '%.2f'|format(pallet.purchase_price_gbp or 0) }}">
+            </div>
+            <div class="form-group">
+                <label>Purchase Date</label>
+                <input type="date" name="purchase_date" class="form-control" value="{{ pallet.purchase_date or '' }}">
+            </div>
+            <div class="form-group">
+                <label>Notes</label>
+                <textarea name="notes" class="form-control" rows="3">{{ pallet.notes or '' }}</textarea>
+            </div>
+            <div class="d-flex gap-8" style="justify-content:flex-end">
+                <button type="button" class="btn btn-outline" onclick="document.getElementById('editPalletModal').classList.remove('active')">Cancel</button>
+                <button type="submit" class="btn btn-cyan">
+                    <span class="material-symbols-outlined">save</span> Save
+                </button>
+            </div>
         </form>
     </div>
 </div>

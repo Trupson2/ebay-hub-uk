@@ -397,19 +397,25 @@ def _scrape_single_domain(asin, domain, session=None):
         return None
 
 
-def scrape_amazon_product(asin, domain=None):
+def scrape_amazon_product(asin, domain=None, strict=False):
     """
     Scrape product data from Amazon for a given ASIN.
 
-    Auto-detect vs. explicit mode:
-    - If `domain` is None (default): walk AMAZON_DOMAINS in priority order,
-      return the first locale where the ASIN actually resolves to a valid
-      product page. The caller learns which domain worked from the
-      `source_domain` key in the return dict — we then cache that on the
-      pallet, so subsequent re-scrapes skip the cascade.
-    - If `domain` is given: scrape only that locale. Use this when the uncle
-      has set a manual override on the pallet (e.g. the auto-detected domain
-      pulled the wrong variant and he wants to force a specific one).
+    `domain` is a SOFT HINT, not a hard lock:
+    - If `domain` is given: try that locale first, and if the ASIN isn't
+      there, cascade through the remaining locales. This mirrors the uncle's
+      Akces Hub behaviour — pallets often contain ASINs sourced across
+      multiple regions, so hard-locking to one locale silently drops the
+      products that live elsewhere (the exact bug that produced the "no
+      image for half the products" reports).
+    - If `domain` is None: cascade through AMAZON_DOMAINS in priority order.
+    - If `strict=True` AND `domain` is given: legacy strict mode, only that
+      locale is tried. Reserved for cases where the caller knows the ASIN
+      is truly locale-specific (different product per region).
+
+    The caller can tell which locale actually served the page via the
+    `source_domain` key in the return dict, and cache that on the pallet
+    so subsequent scrapes put the correct locale first in the cascade.
 
     Non-English locales are fetched via the /-/en/ URL prefix, so titles/
     specs come back in English regardless of the domain.
@@ -424,22 +430,24 @@ def scrape_amazon_product(asin, domain=None):
     valid_domains = {d for d, _ in AMAZON_DOMAINS}
     session = _create_session()
 
-    # Explicit-override mode: scrape only the requested domain. No fallback —
-    # if the uncle picked this domain manually, silently cascading elsewhere
-    # would defeat the point of the override.
-    if domain:
-        if domain not in valid_domains:
-            logger.warning(f"Unknown Amazon domain '{domain}' for {asin}")
-            return None
-        return _scrape_single_domain(asin, domain, session=session)
+    # Build the try-order: hint first, then the rest of AMAZON_DOMAINS.
+    # Unknown hint is silently ignored (falls through to full cascade).
+    if domain and domain in valid_domains:
+        if strict:
+            return _scrape_single_domain(asin, domain, session=session)
+        try_order = [domain] + [d for d, _ in AMAZON_DOMAINS if d != domain]
+    else:
+        try_order = [d for d, _ in AMAZON_DOMAINS]
 
-    # Auto-detect mode: try each locale in priority order, return the first
-    # hit. ASINs are usually unique per-region in practice (supplier picks
-    # the locale they source from), so cascade tends to find exactly one.
-    for d, _currency in AMAZON_DOMAINS:
+    for d in try_order:
         result = _scrape_single_domain(asin, d, session=session)
         if result:
-            logger.info(f"[SCRAPE] Auto-detected {asin} on {d}")
+            if domain and d == domain:
+                logger.info(f"[SCRAPE] {asin} found on hinted locale {d}")
+            elif domain:
+                logger.info(f"[SCRAPE] {asin} not on hint {domain}, fell back to {d}")
+            else:
+                logger.info(f"[SCRAPE] Auto-detected {asin} on {d}")
             return result
 
     logger.warning(f"[SCRAPE] {asin} not found on any Amazon locale")
