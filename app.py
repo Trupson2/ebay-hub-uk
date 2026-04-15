@@ -691,18 +691,45 @@ def _run_pallet_scrape(pallet_id, override):
     import requests as _req
 
     try:
+        # Skip products that already have an image. The uncle asked for this
+        # explicitly — once a product is scraped successfully there's no
+        # point hitting Amazon again (wastes time and bumps into CAPTCHA
+        # faster). A product counts as "already has image" if image_url is
+        # set OR its images JSON gallery has at least one entry. If the user
+        # wants to force a re-scrape they can clear image_url from the
+        # product edit page first.
         products = query_db(
-            "SELECT * FROM products WHERE pallet_id = ? AND asin != ''",
+            "SELECT * FROM products "
+            "WHERE pallet_id = ? AND asin != '' "
+            "  AND (image_url IS NULL OR image_url = '') "
+            "  AND (images IS NULL OR images = '' OR images = '[]')",
             (pallet_id,)
         )
-        total = len(products)
-        with _scrape_lock:
-            _scrape_jobs[pallet_id]['total'] = total
+        total_pending = len(products)
 
-        if total == 0:
+        # Include already-scraped count in the progress denominator so the
+        # bar reads "47 / 50" instead of "3 / 3" for a mostly-done pallet.
+        already = query_db(
+            "SELECT COUNT(*) AS c FROM products "
+            "WHERE pallet_id = ? AND asin != '' "
+            "  AND ((image_url IS NOT NULL AND image_url <> '') "
+            "       OR (images IS NOT NULL AND images <> '' AND images <> '[]'))",
+            (pallet_id,), one=True
+        )
+        already_cnt = (already['c'] if already else 0)
+        total_display = total_pending + already_cnt
+
+        with _scrape_lock:
+            _scrape_jobs[pallet_id]['total'] = total_display
+            # Pre-credit the already-scraped products so the progress bar
+            # starts at the right position and the "updated" count includes
+            # what was there before.
+            _scrape_jobs[pallet_id]['done'] = already_cnt
+
+        if total_pending == 0:
             with _scrape_lock:
                 _scrape_jobs[pallet_id].update(
-                    status='done', where='', updated=0
+                    status='done', where='', updated=already_cnt
                 )
             return
 
@@ -748,7 +775,12 @@ def _run_pallet_scrape(pallet_id, override):
                         continue
 
             with _scrape_lock:
-                _scrape_jobs[pallet_id].update(done=i + 1, updated=updated)
+                # done counts both pre-existing and newly-scraped so the
+                # progress bar stays accurate when we skipped products.
+                _scrape_jobs[pallet_id].update(
+                    done=already_cnt + i + 1,
+                    updated=already_cnt + updated,
+                )
 
         # Cache first auto-detected locale on the pallet so future scrapes skip the cascade
         if not override and detected_domain:
@@ -758,7 +790,7 @@ def _run_pallet_scrape(pallet_id, override):
             _scrape_jobs[pallet_id].update(
                 status='done',
                 where=(override or detected_domain or 'Amazon'),
-                updated=updated,
+                updated=already_cnt + updated,
             )
     except Exception as e:
         with _scrape_lock:
