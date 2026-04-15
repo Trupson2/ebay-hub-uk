@@ -126,20 +126,67 @@ def _extract_title(soup):
 
 
 def _extract_image(soup):
-    """Extract main product image URL from Amazon page."""
-    # Try the main image element
-    img = soup.select_one('#landingImage')
-    if img:
-        # data-old-hires has the high-res version
-        src = img.get('data-old-hires') or img.get('src')
-        if src and 'placeholder' not in src.lower():
+    """Extract main product image URL from Amazon page.
+    Tries a cascade of selectors — Amazon swaps layouts between regular
+    listings, 'Currently unavailable' pages, ebooks, and mobile-style
+    pages. We were previously missing all 'Currently unavailable' pages
+    because they don't always use #landingImage."""
+
+    def _best_from_dynamic(img_tag):
+        """data-a-dynamic-image is a JSON blob of URL -> [width, height].
+        Pick the biggest. This is the most reliable source on modern
+        Amazon pages because it's the same thing the gallery JS reads."""
+        if not img_tag:
+            return None
+        dyn = img_tag.get('data-a-dynamic-image')
+        if dyn:
+            try:
+                data = json.loads(dyn)
+                if isinstance(data, dict) and data:
+                    # Pick URL with the largest width
+                    best = max(data.items(), key=lambda kv: (kv[1][0] if isinstance(kv[1], list) and kv[1] else 0))
+                    return best[0]
+            except Exception:
+                pass
+        return None
+
+    def _src_of(img_tag):
+        if not img_tag:
+            return None
+        src = (
+            _best_from_dynamic(img_tag)
+            or img_tag.get('data-old-hires')
+            or img_tag.get('data-a-hires')
+            or img_tag.get('src')
+        )
+        if src and 'placeholder' not in src.lower() and 'transparent' not in src.lower():
+            return src
+        return None
+
+    # Try the well-known selectors in priority order. "Currently unavailable"
+    # pages usually still render #landingImage, but sometimes fall back to
+    # #imgTagWrapperId img or the dynamic-image container.
+    for sel in (
+        '#landingImage',
+        '#imgBlkFront',
+        '#imgTagWrapperId img',
+        '#main-image-container img',
+        '.imgTagWrapper img',
+        '#ebooksImgBlkFront',
+        'img.a-dynamic-image',
+        'img[data-a-dynamic-image]',
+    ):
+        img = soup.select_one(sel)
+        src = _src_of(img)
+        if src:
             return src
 
-    # Try alternative image container
-    img = soup.select_one('#imgBlkFront')
-    if img:
-        src = img.get('src')
-        if src:
+    # Last resort: Open Graph meta tag — Amazon always sets this even
+    # for unavailable products.
+    og = soup.select_one('meta[property="og:image"]')
+    if og and og.get('content'):
+        src = og['content']
+        if 'placeholder' not in src.lower():
             return src
 
     return None
@@ -365,12 +412,34 @@ def _scrape_single_domain(asin, domain, session=None):
             logger.info(f"[SCRAPE] No title on {domain} for {asin} — ASIN not listed on this locale")
             return None
 
-        image_url = _extract_image(soup) or get_amazon_image_url(asin)
+        # Extract gallery first so we can use it as a fallback for the main
+        # image. The legacy fallback (get_amazon_image_url(asin)) was broken —
+        # it used the ASIN as the image path, but Amazon image IDs and ASINs
+        # are different namespaces, so that URL is basically always a 404.
+        all_images = _extract_all_images(soup, page_text=resp.text, asin=asin)
         price = _extract_price(soup)
         bullet_points = _extract_bullet_points(soup)
         category = _extract_category(soup)
-        all_images = _extract_all_images(soup, page_text=resp.text, asin=asin)
         item_specifics = _extract_item_specifics(soup)
+
+        # Main image: try the DOM extractor first, then fall back to the
+        # first gallery image (which is often extracted from embedded JSON
+        # even on "Currently unavailable" pages).
+        image_url = _extract_image(soup)
+        if not image_url and all_images:
+            # _extract_all_images has a last-resort fallback that constructs
+            # a URL from the ASIN itself (/I/{asin}._AC_SL1500_.jpg). That
+            # URL is almost always 404 because Amazon image IDs and ASINs
+            # are separate namespaces. Prefer any gallery entry that didn't
+            # come from that constructed pattern.
+            constructed_basename = f"{asin}."
+            for candidate in all_images:
+                basename = candidate.rsplit('/', 1)[-1]
+                if not basename.startswith(constructed_basename):
+                    image_url = candidate
+                    break
+            if not image_url:
+                image_url = all_images[0]
 
         # Ensure main image is first in all_images
         if image_url and image_url not in all_images:
