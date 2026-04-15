@@ -2840,7 +2840,7 @@ function generateAI(type) {
     fetch('/api/generate-' + type, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({product_name: name, condition: '{{ product.condition }}'})
+        body: JSON.stringify({product_id: {{ product.id }}, product_name: name, condition: '{{ product.condition }}'})
     }).then(r => r.json()).then(d => {
         if (d.ok) {
             if (type === 'title') document.querySelector('[name="title"]').value = d.text;
@@ -3769,9 +3769,20 @@ def auto_process_products(pallet_id):
             context = "\n".join(context_parts) if context_parts else ""
 
             # --- Step 2: Generate eBay-optimized title ---
+            # Feed Gemini our scraped Specs as source of truth, and warn that
+            # the Amazon product name may mix variant keywords.
             title_prompt = (
                 f'Generate a concise eBay UK listing title (max 80 characters) for this product. '
-                f'Include key specs, brand, and model. No quotes, no special characters. English only.\n\n'
+                f'Include brand, model, product type, size, and key functional specs. '
+                f'\n\n'
+                f'Data source rules:\n'
+                f'- The "Specs:" block below is from our scraper — SOURCE OF TRUTH. '
+                f'Use it for brand, model, size, material, etc.\n'
+                f'- The "Product:" name is from Amazon and often bundles several variants '
+                f'under one keyword-stuffed title (colour, theme, pattern, seasonal motif). '
+                f'Do NOT echo colour/theme/pattern words from the product name unless '
+                f'they also appear in Specs.\n\n'
+                f'No quotes, no special characters. English only.\n\n'
                 f'Product: {product_name}\n'
                 f'{context}\n\n'
                 f'Return ONLY the title, nothing else.'
@@ -3782,12 +3793,25 @@ def auto_process_products(pallet_id):
             time.sleep(1)
 
             # --- Step 3: Generate HTML description ---
-            # Note: do NOT mention condition in the description — eBay shows it
-            # as a dedicated field on the listing, so repeating it is redundant.
+            # Rules for the model:
+            #   - Use our Specs block as the source of truth (scraper output).
+            #   - Don't mention condition (eBay shows it as a dedicated field).
+            #   - Don't echo colour/theme/pattern words from the Amazon name
+            #     unless they appear in Specs (Amazon often bundles variants).
             desc_prompt = (
                 f'Generate a professional eBay UK product description in HTML. '
-                f'Include: product highlights as bullet points, key specifications table, '
-                f'and professional closing. '
+                f'Include: product highlights as bullet points, a key specifications table, '
+                f'and a professional closing. '
+                f'\n\n'
+                f'Data source rules:\n'
+                f'- The "Specs:" block below is from our scraper — SOURCE OF TRUTH. '
+                f'Build the specifications table from it. Every row must come from Specs.\n'
+                f'- The "Product:" name is from Amazon and often bundles several variants '
+                f'under one keyword-stuffed title (colour, theme, pattern, seasonal motif). '
+                f'Do NOT echo colour/theme/pattern words from the product name in the '
+                f'description unless they also appear in Specs. Let the photos show the '
+                f'exact variant.\n'
+                f'- Features may come from the "Features:" block if present.\n\n'
                 f'Do NOT mention the product condition anywhere — eBay displays it separately. '
                 f'Use clean HTML (div, ul, li, p, strong, table tags). '
                 f'Do NOT include <html>, <head>, or <body> tags. '
@@ -3956,6 +3980,22 @@ def api_generate_title():
     """Generate eBay-optimized title using Gemini AI."""
     data = request.get_json() or {}
     product_name = data.get('product_name', '')
+    product_id = data.get('product_id')
+
+    # Pull our scraped specs from DB — gives Gemini a SOURCE OF TRUTH so it
+    # doesn't just echo variant keywords from the Amazon product name.
+    specs_text = ''
+    if product_id:
+        row = query_db("SELECT item_specifics FROM products WHERE id = ?",
+                       (product_id,), one=True)
+        if row and row.get('item_specifics'):
+            try:
+                sp = json.loads(row['item_specifics'])
+                if isinstance(sp, dict) and sp:
+                    specs_text = 'Specs: ' + ', '.join(f'{k}: {v}' for k, v in list(sp.items())[:10])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     if not product_name:
         return jsonify({'ok': False, 'error': 'No product name'})
 
@@ -3970,8 +4010,16 @@ def api_generate_title():
             json={
                 'contents': [{'parts': [{'text':
                     f'Generate a concise eBay UK listing title (max 80 characters) for this product. '
-                    f'Include key specs and brand. No quotes, no special characters. English only.\n\n'
-                    f'Product: {product_name}\n\n'
+                    f'Include brand, model, product type, size, and key functional specs. '
+                    f'\n\n'
+                    f'Data source rules:\n'
+                    f'- The "Specs:" block is from our scraper — SOURCE OF TRUTH.\n'
+                    f'- The "Product:" name is from Amazon and may bundle variant keywords '
+                    f'(colour/theme/pattern) that do not match the physical item. Do NOT copy '
+                    f'colour/theme/pattern words from the name unless they also appear in Specs.\n\n'
+                    f'No quotes, no special characters. English only.\n\n'
+                    f'Product: {product_name}\n'
+                    f'{specs_text}\n\n'
                     f'Return ONLY the title, nothing else.'
                 }]}]
             },
@@ -3994,6 +4042,22 @@ def api_generate_description():
     """Generate eBay product description using Gemini AI."""
     data = request.get_json() or {}
     product_name = data.get('product_name', '')
+    product_id = data.get('product_id')
+
+    # Pull our scraped specs from DB so Gemini builds the spec table from
+    # structured data rather than inventing from the Amazon product name.
+    specs_text = ''
+    if product_id:
+        row = query_db("SELECT item_specifics FROM products WHERE id = ?",
+                       (product_id,), one=True)
+        if row and row.get('item_specifics'):
+            try:
+                sp = json.loads(row['item_specifics'])
+                if isinstance(sp, dict) and sp:
+                    specs_text = 'Specs: ' + ', '.join(f'{k}: {v}' for k, v in list(sp.items())[:10])
+            except (json.JSONDecodeError, TypeError):
+                pass
+
     if not product_name:
         return jsonify({'ok': False, 'error': 'No product name'})
 
@@ -4008,11 +4072,21 @@ def api_generate_description():
             json={
                 'contents': [{'parts': [{'text':
                     f'Generate a professional eBay UK product description in HTML for this product. '
-                    f'Include: key features as bullet points and a professional closing. '
+                    f'Include: key features as bullet points, a specifications table (built from '
+                    f'Specs), and a professional closing. '
+                    f'\n\n'
+                    f'Data source rules:\n'
+                    f'- The "Specs:" block is from our scraper — SOURCE OF TRUTH. '
+                    f'Build the specifications table from it.\n'
+                    f'- The "Product:" name is from Amazon and may bundle variant keywords '
+                    f'(colour/theme/pattern) that do not match the physical item. Do NOT copy '
+                    f'colour/theme/pattern words from the name unless they also appear in Specs. '
+                    f'Let the photos show the exact variant.\n\n'
                     f'Do NOT mention the product condition anywhere — eBay displays it separately. '
-                    f'Use clean HTML (div, ul, li, p, strong tags). Keep it concise but informative. '
-                    f'English only. Do NOT include the title.\n\n'
-                    f'Product: {product_name}\n\n'
+                    f'Use clean HTML (div, ul, li, p, strong, table tags). Keep it concise but '
+                    f'informative. English only. Do NOT include the title.\n\n'
+                    f'Product: {product_name}\n'
+                    f'{specs_text}\n\n'
                     f'Return ONLY the HTML description, no markdown, no code blocks.'
                 }]}]
             },
