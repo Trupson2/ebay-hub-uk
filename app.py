@@ -3707,15 +3707,17 @@ def auto_process_products(pallet_id):
             time.sleep(1)
 
             # --- Step 3: Generate HTML description ---
+            # Note: do NOT mention condition in the description — eBay shows it
+            # as a dedicated field on the listing, so repeating it is redundant.
             desc_prompt = (
                 f'Generate a professional eBay UK product description in HTML. '
                 f'Include: product highlights as bullet points, key specifications table, '
-                f'condition note, and professional closing. '
+                f'and professional closing. '
+                f'Do NOT mention the product condition anywhere — eBay displays it separately. '
                 f'Use clean HTML (div, ul, li, p, strong, table tags). '
                 f'Do NOT include <html>, <head>, or <body> tags. '
                 f'Keep it concise but informative. English only.\n\n'
                 f'Product: {product_name}\n'
-                f'Condition: {product.get("condition", "new")}\n'
                 f'{context}\n\n'
                 f'Return ONLY the HTML description, no markdown, no code blocks.'
             )
@@ -3917,7 +3919,6 @@ def api_generate_description():
     """Generate eBay product description using Gemini AI."""
     data = request.get_json() or {}
     product_name = data.get('product_name', '')
-    condition = data.get('condition', 'new')
     if not product_name:
         return jsonify({'ok': False, 'error': 'No product name'})
 
@@ -3932,11 +3933,11 @@ def api_generate_description():
             json={
                 'contents': [{'parts': [{'text':
                     f'Generate a professional eBay UK product description in HTML for this product. '
-                    f'Include: key features as bullet points, condition note, and a professional closing. '
+                    f'Include: key features as bullet points and a professional closing. '
+                    f'Do NOT mention the product condition anywhere — eBay displays it separately. '
                     f'Use clean HTML (div, ul, li, p, strong tags). Keep it concise but informative. '
                     f'English only. Do NOT include the title.\n\n'
-                    f'Product: {product_name}\n'
-                    f'Condition: {condition}\n\n'
+                    f'Product: {product_name}\n\n'
                     f'Return ONLY the HTML description, no markdown, no code blocks.'
                 }]}]
             },
