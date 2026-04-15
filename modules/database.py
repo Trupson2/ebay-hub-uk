@@ -113,6 +113,9 @@ def init_db():
         ('products', 'height_cm', 'REAL DEFAULT 0.0'),
         ('products', 'shipping_method', "TEXT DEFAULT ''"),
         ('products', 'shipping_cost_gbp', 'REAL DEFAULT 0.0'),
+        # shipping_pricing_mode: '' = use Settings default, 'flat' = flat rate,
+        # 'calculated' = eBay calculates from weight/dims/postcode.
+        ('products', 'shipping_pricing_mode', "TEXT DEFAULT ''"),
         ('products', 'images', "TEXT DEFAULT ''"),
         ('products', 'item_specifics', "TEXT DEFAULT ''"),
         ('ebay_listings', 'category_id', "TEXT DEFAULT ''"),

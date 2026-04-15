@@ -279,6 +279,17 @@ def get_shipping_options_grouped():
     return out
 
 
+def supports_calculated_shipping(shipping_key):
+    """
+    Whether the shipping method supports eBay's Calculated Shipping.
+    Royal Mail + Parcelforce do; UK_OtherCourier / UK_Freight / UK_CollectInPerson
+    / UK_SellerChoice do NOT (flat rate only).
+    """
+    m = SHIPPING_SERVICE_MAP.get(shipping_key) or {}
+    svc = m.get('ebay_service', '')
+    return svc.startswith('UK_RoyalMail') or svc.startswith('UK_ParcelForce')
+
+
 def validate_shipping_fit(shipping_key, weight_kg=None, length_cm=None, width_cm=None, height_cm=None):
     """
     Check if a product fits the shipping method's weight + dimension limits.
@@ -431,6 +442,12 @@ class EbayAPI:
                 - dispatch_days: int (default 3)
                 - shipping_service: str (config key, default 'royal_mail_2nd')
                 - shipping_cost: float (override, optional)
+                - shipping_pricing_mode: str ('flat' or 'calculated', default 'flat').
+                  'calculated' requires origin_postcode + weight + dims AND the
+                  shipping method must support Calculated (Royal Mail / Parcelforce
+                  only). Falls back to flat if prerequisites missing.
+                - origin_postcode: str (seller's postcode, required for calculated)
+                - weight_kg, length_cm, width_cm, height_cm: float (required for calculated)
                 - return_days: int (default 30)
                 - item_specifics: dict (optional, key-value pairs for eBay ItemSpecifics)
 
@@ -451,11 +468,80 @@ class EbayAPI:
 
         condition_id = CONDITION_MAP.get(condition, '3000')
 
-        # Shipping
+        # Shipping — resolve method, pricing mode, and build the right XML block.
         method = get_shipping_method(shipping_key)
         shipping_service = method['ebay_service']
         default_cost = method['default_cost']
         shipping_cost = product_data.get('shipping_cost', default_cost)
+
+        pricing_mode = (product_data.get('shipping_pricing_mode') or 'flat').lower()
+        origin_postcode = (product_data.get('origin_postcode') or '').strip()
+        wkg = float(product_data.get('weight_kg') or 0)
+        L = float(product_data.get('length_cm') or 0)
+        W = float(product_data.get('width_cm') or 0)
+        H = float(product_data.get('height_cm') or 0)
+
+        # Calculated shipping prerequisites: the method must support it, seller
+        # postcode must be set, and product must have a non-zero weight.
+        # If any is missing, fall back to Flat and log why.
+        use_calc = pricing_mode == 'calculated'
+        calc_fallback_reason = None
+        if use_calc:
+            if not supports_calculated_shipping(shipping_key):
+                use_calc = False
+                calc_fallback_reason = f"method '{shipping_key}' -> {shipping_service} does not support Calculated on eBay UK (only Royal Mail / Parcelforce do)"
+            elif not origin_postcode:
+                use_calc = False
+                calc_fallback_reason = "origin_postcode not set in Settings"
+            elif wkg <= 0:
+                use_calc = False
+                calc_fallback_reason = "product has no weight_kg set"
+
+        if use_calc:
+            # eBay wants integer kg + remaining grams separately.
+            major = int(wkg)
+            minor = int(round((wkg - major) * 1000))
+            # Dimensions: default to 1 if missing (eBay requires >0).
+            Li, Wi, Hi = max(1, int(round(L))), max(1, int(round(W))), max(1, int(round(H)))
+            shipping_details_xml = f"""<ShippingDetails>
+            <ShippingType>Calculated</ShippingType>
+            <ShippingServiceOptions>
+                <ShippingServicePriority>1</ShippingServicePriority>
+                <ShippingService>{shipping_service}</ShippingService>
+            </ShippingServiceOptions>
+            <CalculatedShippingRate>
+                <OriginatingPostalCode>{self._escape_xml(origin_postcode)}</OriginatingPostalCode>
+                <PackageDepth measurementSystem="Metric" unit="centimeters">{Hi}</PackageDepth>
+                <PackageLength measurementSystem="Metric" unit="centimeters">{Li}</PackageLength>
+                <PackageWidth measurementSystem="Metric" unit="centimeters">{Wi}</PackageWidth>
+                <WeightMajor measurementSystem="Metric" unit="kilograms">{major}</WeightMajor>
+                <WeightMinor measurementSystem="Metric" unit="grams">{minor}</WeightMinor>
+                <ShippingPackage>PackageThickEnvelope</ShippingPackage>
+            </CalculatedShippingRate>
+        </ShippingDetails>"""
+        else:
+            # Flat rate: we set the shipping cost upfront.
+            free_tag = '<FreeShipping>true</FreeShipping>' if shipping_cost == 0 else ''
+            shipping_details_xml = f"""<ShippingDetails>
+            <ShippingType>Flat</ShippingType>
+            <ShippingServiceOptions>
+                <ShippingServicePriority>1</ShippingServicePriority>
+                <ShippingService>{shipping_service}</ShippingService>
+                <ShippingServiceCost currencyID="GBP">{shipping_cost:.2f}</ShippingServiceCost>
+                <ShippingServiceAdditionalCost currencyID="GBP">{shipping_cost:.2f}</ShippingServiceAdditionalCost>
+                {free_tag}
+            </ShippingServiceOptions>
+        </ShippingDetails>"""
+
+        # Debug logging — one-liner so it's easy to grep in journalctl.
+        print(
+            f"[eBay API] Shipping: key='{shipping_key}' -> service='{shipping_service}' "
+            f"mode={'Calculated' if use_calc else 'Flat'} "
+            f"cost={'(eBay calculates)' if use_calc else f'GBP {shipping_cost:.2f}'} "
+            f"postcode={origin_postcode or '-'} "
+            f"weight={wkg}kg dims={int(L)}x{int(W)}x{int(H)}cm"
+            + (f" [calc->flat fallback: {calc_fallback_reason}]" if calc_fallback_reason else "")
+        )
 
         # Build PictureURL elements
         picture_xml = ''
@@ -530,16 +616,7 @@ class EbayAPI:
             <ReturnsAcceptedOption>ReturnsAccepted</ReturnsAcceptedOption>
             <ReturnsWithinOption>Days_30</ReturnsWithinOption>
         </ReturnPolicy>
-        <ShippingDetails>
-            <ShippingType>Flat</ShippingType>
-            <ShippingServiceOptions>
-                <ShippingServicePriority>1</ShippingServicePriority>
-                <ShippingService>{shipping_service}</ShippingService>
-                <ShippingServiceCost currencyID="GBP">{shipping_cost:.2f}</ShippingServiceCost>
-                <ShippingServiceAdditionalCost currencyID="GBP">{shipping_cost:.2f}</ShippingServiceAdditionalCost>
-                {'<FreeShipping>true</FreeShipping>' if shipping_cost == 0 else ''}
-            </ShippingServiceOptions>
-        </ShippingDetails>
+        {shipping_details_xml}
         <Site>UK</Site>
     </Item>
 </AddItemRequest>"""

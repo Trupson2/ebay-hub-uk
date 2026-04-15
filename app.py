@@ -610,7 +610,8 @@ def pallet_publish_all(pallet_id):
 
     drafts = query_db(
         """SELECT l.*, p.image_url, p.images, p.condition, p.quantity, p.ean, p.id as prod_id,
-                  p.shipping_method, p.shipping_cost_gbp, p.category, p.item_specifics as prod_specs,
+                  p.shipping_method, p.shipping_cost_gbp, p.shipping_pricing_mode,
+                  p.category, p.item_specifics as prod_specs,
                   p.weight_kg, p.length_cm, p.width_cm, p.height_cm
            FROM ebay_listings l
            JOIN products p ON p.id = l.product_id
@@ -624,6 +625,8 @@ def pallet_publish_all(pallet_id):
 
     shipping_key = get_config('default_shipping', 'royal_mail_2nd')
     return_days = int(get_config('default_return_days', '30') or '30')
+    default_pricing = get_config('default_shipping_pricing', 'flat') or 'flat'
+    origin_postcode = get_config('seller_postcode', '')
 
     published = 0
     failed = 0
@@ -673,6 +676,7 @@ def pallet_publish_all(pallet_id):
 
             # Category from listing or product (format: "id:name" or just "id")
             _cat = (draft.get('category_id') or draft.get('category') or '175673').split(':')[0]
+            prod_pricing = (draft.get('shipping_pricing_mode') or '').strip() or default_pricing
             result = ebay.create_listing({
                 'title': draft['title'],
                 'description': draft['description'],
@@ -686,6 +690,12 @@ def pallet_publish_all(pallet_id):
                 'shipping_service': prod_shipping,
                 'item_specifics': listing_specs,
                 'shipping_cost': prod_shipping_cost,
+                'shipping_pricing_mode': prod_pricing,
+                'origin_postcode': origin_postcode,
+                'weight_kg': draft.get('weight_kg'),
+                'length_cm': draft.get('length_cm'),
+                'width_cm': draft.get('width_cm'),
+                'height_cm': draft.get('height_cm'),
                 'return_days': return_days,
             })
 
@@ -770,6 +780,9 @@ def product_update(product_id):
     height_cm = request.form.get('height_cm', '0')
     shipping_method = request.form.get('shipping_method', '')
     shipping_cost = request.form.get('shipping_cost_gbp', '0')
+    shipping_pricing_mode = request.form.get('shipping_pricing_mode', '')
+    if shipping_pricing_mode not in ('', 'flat', 'calculated'):
+        shipping_pricing_mode = ''
 
     try:
         quantity = int(quantity)
@@ -795,10 +808,12 @@ def product_update(product_id):
     execute_db(
         "UPDATE products SET name=?, asin=?, ean=?, quantity=?, condition=?, "
         "ebay_price_gbp=?, category=?, image_url=?, status=?, "
-        "weight_kg=?, length_cm=?, width_cm=?, height_cm=?, shipping_method=?, shipping_cost_gbp=? WHERE id=?",
+        "weight_kg=?, length_cm=?, width_cm=?, height_cm=?, shipping_method=?, "
+        "shipping_cost_gbp=?, shipping_pricing_mode=? WHERE id=?",
         (name, asin, ean, quantity, condition, ebay_price,
          category, image_url, status,
-         weight_kg, length_cm, width_cm, height_cm, shipping_method, shipping_cost, product_id)
+         weight_kg, length_cm, width_cm, height_cm, shipping_method,
+         shipping_cost, shipping_pricing_mode, product_id)
     )
     flash('Product updated.', 'success')
     return redirect(url_for('product_detail', product_id=product_id))
@@ -877,6 +892,10 @@ def list_on_ebay(product_id):
 
     shipping_key = product.get('shipping_method') or get_config('default_shipping', 'royal_mail_2nd')
     shipping_cost = product.get('shipping_cost_gbp') or 0
+    # Per-product pricing mode; '' means fall back to Settings default.
+    pricing_mode = (product.get('shipping_pricing_mode') or '').strip() \
+        or get_config('default_shipping_pricing', 'flat') or 'flat'
+    origin_postcode = get_config('seller_postcode', '')
     return_days = int(get_config('default_return_days', '30') or '30')
     cat = (product.get('category') or '175673').split(':')[0]
 
@@ -923,6 +942,12 @@ def list_on_ebay(product_id):
         'dispatch_days': 3,
         'shipping_service': shipping_key,
         'shipping_cost': shipping_cost,
+        'shipping_pricing_mode': pricing_mode,
+        'origin_postcode': origin_postcode,
+        'weight_kg': product.get('weight_kg'),
+        'length_cm': product.get('length_cm'),
+        'width_cm': product.get('width_cm'),
+        'height_cm': product.get('height_cm'),
         'return_days': return_days,
         'item_specifics': prod_specs,
     })
@@ -2720,8 +2745,23 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
                 </div>
                 <div class="form-group">
                     <label class="form-label">Shipping Cost (GBP)</label>
-                    <input type="number" step="0.01" name="shipping_cost_gbp" class="form-control" value="{{ product.shipping_cost_gbp or '' }}" placeholder="0.00 = free postage">
-                    <div class="form-hint">0 = free postage (recommended for better sales)</div>
+                    <input type="number" step="0.01" name="shipping_cost_gbp" class="form-control" value="{{ product.shipping_cost_gbp or '' }}" placeholder="np. 5.99 — koszt kuriera">
+                    <div class="form-hint">
+                        <strong>0</strong> = "Free delivery" na eBay (wliczone w cenę, lepszy ranking — <em>wujek płaci kurierowi</em>).<br>
+                        <strong>&gt; 0</strong> = kupujący dopłaca tę kwotę za wysyłkę (wujek nie dokłada).<br>
+                        W trybie <strong>Calculated</strong> to pole jest ignorowane — eBay liczy sam.
+                    </div>
+                </div>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label class="form-label">Shipping Pricing Mode (for this product)</label>
+                    <select name="shipping_pricing_mode" class="form-control">
+                        <option value="" {{ 'selected' if not product.shipping_pricing_mode }}>Use default (Settings)</option>
+                        <option value="flat" {{ 'selected' if product.shipping_pricing_mode == 'flat' }}>Flat rate (ręczna cena powyżej)</option>
+                        <option value="calculated" {{ 'selected' if product.shipping_pricing_mode == 'calculated' }}>Calculated (eBay liczy z wagi/wymiarów)</option>
+                    </select>
+                    <div class="form-hint">Calculated wymaga wagi + wymiarów + Royal Mail/Parcelforce jako metody. Inaczej apka użyje Flat rate.</div>
                 </div>
             </div>
         </div>
@@ -3299,6 +3339,25 @@ TEMPLATE_SETTINGS_CONTENT = """
                 <div class="form-hint">eBay UK requires minimum 14 days for consumer sales</div>
             </div>
         </div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">Shipping Pricing Mode</label>
+                <select name="default_shipping_pricing" class="form-control">
+                    <option value="flat" {{ 'selected' if (config.default_shipping_pricing or 'flat') == 'flat' }}>Flat rate (wpisujesz cenę ręcznie)</option>
+                    <option value="calculated" {{ 'selected' if config.default_shipping_pricing == 'calculated' }}>Calculated (eBay liczy z wagi + kodu pocztowego)</option>
+                </select>
+                <div class="form-hint">
+                    <strong>Flat</strong>: wpisujesz koszt wysyłki na każdym produkcie.<br>
+                    <strong>Calculated</strong>: eBay liczy sam z wagi/wymiarów/kodu kupującego — działa tylko dla <em>Royal Mail</em> i <em>Parcelforce</em>. Dla innych kurierów (DPD, Evri, UPS...) apka sama cofa się do Flat.
+                </div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Seller Postcode (nadawcy)</label>
+                <input type="text" name="seller_postcode" class="form-control"
+                       value="{{ config.seller_postcode or '' }}" placeholder="np. SW1A 1AA" maxlength="10">
+                <div class="form-hint">Kod pocztowy wujka (skąd wysyła). Wymagany dla Calculated Shipping.</div>
+            </div>
+        </div>
     </div>
 
     <button type="submit" class="btn btn-cyan">
@@ -3405,7 +3464,8 @@ def settings():
         'ebay_app_id', 'ebay_cert_id', 'ebay_dev_id', 'ebay_user_token',
         'gemini_api_key',
         'telegram_bot_token', 'telegram_chat_id',
-        'default_shipping', 'default_return_days'
+        'default_shipping', 'default_return_days',
+        'default_shipping_pricing', 'seller_postcode',
     ]
     for key in keys:
         config[key] = get_config(key, '')
