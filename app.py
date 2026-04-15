@@ -714,16 +714,30 @@ def _run_pallet_scrape(pallet_id, override):
         )
 
         def _needs_work(p):
-            has_image = (
-                (p.get('image_url') or '').strip()
-                or (p.get('images') or '').strip() not in ('', '[]')
+            """A product needs re-scraping if any of:
+              - it has no image at all, or
+              - its image_url is the broken ASIN-based fallback that the old
+                code wrote before the scraper was fixed (pattern:
+                /I/{ASIN}._AC_SL1500_.jpg — almost always a 404), or
+              - its title still has non-ASCII chars (Polish/German/etc)."""
+            asin = (p.get('asin') or '').strip()
+            img_url = (p.get('image_url') or '').strip()
+            images = (p.get('images') or '').strip()
+
+            # Detect the broken constructed-from-ASIN URL. Real Amazon image
+            # paths contain IDs like "51b9uFtR45L" — they don't start with
+            # "B0..." (the ASIN namespace).
+            constructed_pattern = f"/I/{asin}." if asin else None
+            looks_broken = bool(constructed_pattern and constructed_pattern in img_url)
+
+            has_real_image = (
+                (img_url and not looks_broken)
+                or (images and images != '[]')
             )
             non_english_title = any(
                 c.isalpha() and ord(c) > 127 for c in (p.get('name') or '')
             )
-            # Work to do if: no image at all, OR title is still non-English
-            # (we upgrade those to English via amazon.co.uk — see scraper).
-            return (not has_image) or non_english_title
+            return (not has_real_image) or non_english_title
 
         products = [p for p in all_products if _needs_work(p)]
         total_pending = len(products)
@@ -2686,14 +2700,25 @@ function bulkDeletePallets() {
 
 @app.route('/pallets')
 def pallets_list():
+    # Revenue / sold_count are computed from the `sales` table rather than
+    # products.status so they include both eBay orders (source='ebay') AND
+    # private / cash-in-hand sales (source='private'). The old query only
+    # counted products.status='sold' with products.ebay_price_gbp (the
+    # LISTED price, not the actual sale price), which excluded:
+    #   1. private sales that set status='shipped' instead of 'sold'
+    #   2. the actual sale amount (user may haggle on a private sale)
+    # product_count is pulled via subquery so the join through sales doesn't
+    # multiply rows when a product has more than one sale record.
     pallets = query_db("""
         SELECT p.*,
-            COUNT(pr.id) as product_count,
-            SUM(CASE WHEN pr.status = 'sold' THEN 1 ELSE 0 END) as sold_count,
-            COALESCE(SUM(CASE WHEN pr.status = 'sold' THEN pr.ebay_price_gbp ELSE 0 END), 0) as revenue
+            (SELECT COUNT(*) FROM products WHERE pallet_id = p.id) AS product_count,
+            (SELECT COUNT(*)
+               FROM sales s JOIN products pr ON s.product_id = pr.id
+               WHERE pr.pallet_id = p.id) AS sold_count,
+            (SELECT COALESCE(SUM(s.price_gbp), 0)
+               FROM sales s JOIN products pr ON s.product_id = pr.id
+               WHERE pr.pallet_id = p.id) AS revenue
         FROM pallets p
-        LEFT JOIN products pr ON pr.pallet_id = p.id
-        GROUP BY p.id
         ORDER BY p.created_at DESC
     """)
     return render_page(
@@ -3106,12 +3131,25 @@ def pallet_detail(pallet_id):
         SELECT
             COUNT(*) as total,
             SUM(CASE WHEN status = 'listed' THEN 1 ELSE 0 END) as listed,
-            SUM(CASE WHEN status = 'sold' THEN 1 ELSE 0 END) as sold,
+            SUM(CASE WHEN status IN ('sold', 'shipped') THEN 1 ELSE 0 END) as sold,
             SUM(CASE WHEN status = 'warehouse' THEN 1 ELSE 0 END) as warehouse,
-            COALESCE(SUM(CASE WHEN status = 'sold' THEN ebay_price_gbp ELSE 0 END), 0) as revenue,
             COALESCE(SUM(ebay_price_gbp * quantity), 0) as potential_revenue
         FROM products WHERE pallet_id = ?
     """, (pallet_id,), one=True)
+
+    # Revenue from the sales table — covers both eBay orders and private
+    # cash-in-hand sales (source='private'). The older query used
+    # products.ebay_price_gbp filtered on status='sold', which missed:
+    #   - private sales (recorded with status='shipped' if handed over)
+    #   - haggled prices (sales.price_gbp ≠ the listed ebay_price_gbp)
+    rev_row = query_db("""
+        SELECT COALESCE(SUM(s.price_gbp), 0) AS revenue
+        FROM sales s JOIN products pr ON s.product_id = pr.id
+        WHERE pr.pallet_id = ?
+    """, (pallet_id,), one=True)
+    # stats is a plain dict (query_db one=True returns dict), mutable:
+    stats = dict(stats) if stats else {}
+    stats['revenue'] = rev_row['revenue'] if rev_row else 0
 
     profit = (stats['revenue'] or 0) - (pallet['purchase_price_gbp'] or 0)
 
