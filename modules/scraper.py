@@ -1,9 +1,10 @@
 """
 eBay Hub UK - Amazon Product Scraper & Specification Parser
-Scrapes product data from a single, pallet-configured Amazon locale.
-The same ASIN can mean different products on different locales, so we
-never fall back across domains — the caller (pallet record) picks one.
-Parses pasted joblot specification text to extract product info.
+Scrapes product data from Amazon. Auto-detects the locale where the ASIN
+lives by cascading through AMAZON_DOMAINS; a pallet can override with an
+explicit domain when the auto-detection picks the wrong variant. Non-
+English locales are fetched via /-/en/ so titles/specs come back in
+English regardless. Parses pasted joblot specs to extract product info.
 """
 
 import re
@@ -320,41 +321,16 @@ def _extract_category(soup):
     return ''
 
 
-def scrape_amazon_product(asin, domain):
-    """
-    Scrape product data from Amazon for a given ASIN from a SPECIFIC domain.
+def _scrape_single_domain(asin, domain, session=None):
+    """Single-domain scrape attempt. Returns dict on success, None on failure.
+    Used internally by scrape_amazon_product for both explicit-domain and
+    auto-cascade calls. Kept private so callers always go through the public
+    function, which handles the cascade/override logic consistently."""
+    if session is None:
+        session = _create_session()
 
-    Important: the same ASIN can point to a totally different product on
-    different Amazon locales (e.g. on .co.uk it's a green item, on .de it's
-    a blue one). We deliberately do NOT fall back to other domains — that
-    would mix images/specs from a different product and mislead the uncle
-    when listing on eBay. If the given domain doesn't have the ASIN or
-    throws CAPTCHA, we return None so the caller can show the error.
-
-    `domain` is REQUIRED — no default. It comes from the pallet's
-    amazon_domain config (uncle picks it when adding the pallet based on
-    where the supplier sourced from). Must be one of AMAZON_DOMAINS.
-
-    Returns dict: {title, image_url, price, bullet_points, category,
-    all_images, item_specifics, source_domain} or None on failure.
-    """
-    if not asin or not ASIN_RE.match(asin):
-        logger.warning(f"Invalid ASIN: {asin}")
-        return None
-
-    # Sanity-check the requested domain — if someone passes a typo, an
-    # unknown host, or nothing at all, bail rather than silently hitting
-    # a random URL or picking a wrong domain for the uncle.
-    valid_domains = {d for d, _ in AMAZON_DOMAINS}
-    if not domain or domain not in valid_domains:
-        logger.warning(f"Missing/unknown Amazon domain '{domain}' for {asin} — caller must pass pallet.amazon_domain")
-        return None
-
-    session = _create_session()
     # Amazon respects a /-/en/ path prefix on non-English locales — it forces
-    # the product page to render in English even on .de/.fr/.it/etc. This is
-    # the exact URL shape the user pastes into their browser when checking
-    # a supplier's ASIN (e.g. https://www.amazon.de/-/en/.../dp/ASIN). Without
+    # the product page to render in English even on .de/.fr/.it/etc. Without
     # this, scraping .de gives us German titles/bullets that are useless for
     # an English eBay UK listing.
     if domain in ('amazon.co.uk', 'amazon.com'):
@@ -364,7 +340,7 @@ def scrape_amazon_product(asin, domain):
 
     try:
         # Random delay to look less bot-like
-        time.sleep(random.uniform(1.5, 3.5))
+        time.sleep(random.uniform(1.0, 2.5))
 
         # Visit domain homepage first so we have its cookies
         try:
@@ -379,14 +355,14 @@ def scrape_amazon_product(asin, domain):
             return None
 
         if resp.status_code != 200:
-            logger.warning(f"[SCRAPE] HTTP {resp.status_code} from {domain} for {asin}")
+            logger.info(f"[SCRAPE] HTTP {resp.status_code} from {domain} for {asin} (not listed here)")
             return None
 
         soup = BeautifulSoup(resp.text, 'html.parser')
 
         title = _extract_title(soup)
         if not title:
-            logger.warning(f"No title found on {domain} for {asin} — not listed on this locale")
+            logger.info(f"[SCRAPE] No title on {domain} for {asin} — ASIN not listed on this locale")
             return None
 
         image_url = _extract_image(soup) or get_amazon_image_url(asin)
@@ -419,6 +395,55 @@ def scrape_amazon_product(asin, domain):
     except requests.RequestException as e:
         logger.warning(f"Request failed for {domain}/{asin}: {e}")
         return None
+
+
+def scrape_amazon_product(asin, domain=None):
+    """
+    Scrape product data from Amazon for a given ASIN.
+
+    Auto-detect vs. explicit mode:
+    - If `domain` is None (default): walk AMAZON_DOMAINS in priority order,
+      return the first locale where the ASIN actually resolves to a valid
+      product page. The caller learns which domain worked from the
+      `source_domain` key in the return dict — we then cache that on the
+      pallet, so subsequent re-scrapes skip the cascade.
+    - If `domain` is given: scrape only that locale. Use this when the uncle
+      has set a manual override on the pallet (e.g. the auto-detected domain
+      pulled the wrong variant and he wants to force a specific one).
+
+    Non-English locales are fetched via the /-/en/ URL prefix, so titles/
+    specs come back in English regardless of the domain.
+
+    Returns dict: {title, image_url, price, bullet_points, category,
+    all_images, item_specifics, source_domain} or None on failure.
+    """
+    if not asin or not ASIN_RE.match(asin):
+        logger.warning(f"Invalid ASIN: {asin}")
+        return None
+
+    valid_domains = {d for d, _ in AMAZON_DOMAINS}
+    session = _create_session()
+
+    # Explicit-override mode: scrape only the requested domain. No fallback —
+    # if the uncle picked this domain manually, silently cascading elsewhere
+    # would defeat the point of the override.
+    if domain:
+        if domain not in valid_domains:
+            logger.warning(f"Unknown Amazon domain '{domain}' for {asin}")
+            return None
+        return _scrape_single_domain(asin, domain, session=session)
+
+    # Auto-detect mode: try each locale in priority order, return the first
+    # hit. ASINs are usually unique per-region in practice (supplier picks
+    # the locale they source from), so cascade tends to find exactly one.
+    for d, _currency in AMAZON_DOMAINS:
+        result = _scrape_single_domain(asin, d, session=session)
+        if result:
+            logger.info(f"[SCRAPE] Auto-detected {asin} on {d}")
+            return result
+
+    logger.warning(f"[SCRAPE] {asin} not found on any Amazon locale")
+    return None
 
 
 # ---------------------------------------------------------------------------
