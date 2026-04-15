@@ -10,6 +10,7 @@ import io
 import json
 import time
 import secrets
+import threading
 import requests as http_requests
 from datetime import datetime, timedelta
 
@@ -336,11 +337,40 @@ def pallet_add():
     except ValueError:
         price = 0.0
 
-    pallet_id = execute_db(
-        "INSERT INTO pallets (name, supplier, purchase_price_gbp, purchase_date, notes, amazon_domain) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (name, supplier, price, date, notes, amazon_domain)
+    # Dedup: if an active pallet with the same name+supplier already exists,
+    # reuse it instead of creating a duplicate. The uncle was re-uploading
+    # the same pallet CSV multiple times (partial uploads, retries) and
+    # ending up with 6x "#3 MIX / Jobalots / £300" rows cluttering the list.
+    # Match is case-insensitive and trims whitespace so "#3 MIX" == "#3 mix ".
+    existing = query_db(
+        "SELECT id FROM pallets "
+        "WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) "
+        "AND LOWER(TRIM(COALESCE(supplier,''))) = LOWER(TRIM(COALESCE(?,''))) "
+        "AND status = 'active' "
+        "ORDER BY id DESC LIMIT 1",
+        (name, supplier), one=True
     )
+    merged_into_existing = False
+    if existing:
+        pallet_id = existing['id']
+        merged_into_existing = True
+        # Refresh the other fields in case they changed (notes, price, domain override)
+        if amazon_domain or notes or price:
+            execute_db(
+                "UPDATE pallets SET "
+                "purchase_price_gbp = CASE WHEN ? > 0 THEN ? ELSE purchase_price_gbp END, "
+                "purchase_date = CASE WHEN ? <> '' THEN ? ELSE purchase_date END, "
+                "notes = CASE WHEN ? <> '' THEN ? ELSE notes END, "
+                "amazon_domain = CASE WHEN ? <> '' THEN ? ELSE amazon_domain END "
+                "WHERE id = ?",
+                (price, price, date, date, notes, notes, amazon_domain, amazon_domain, pallet_id)
+            )
+    else:
+        pallet_id = execute_db(
+            "INSERT INTO pallets (name, supplier, purchase_price_gbp, purchase_date, notes, amazon_domain) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (name, supplier, price, date, notes, amazon_domain)
+        )
 
     # Import products from uploaded CSV/XLSX file
     imported = 0
@@ -465,7 +495,10 @@ def pallet_add():
         except Exception as e:
             pipeline_msg = f' Auto-pipeline error: {e}'
 
-    msg = f'Pallet "{name}" added successfully.'
+    if merged_into_existing:
+        msg = f'Pallet "{name}" already existed — merged into existing pallet (no duplicate created).'
+    else:
+        msg = f'Pallet "{name}" added successfully.'
     if imported > 0:
         msg += f' Imported {imported} products'
         if scraped_cnt > 0:
@@ -474,7 +507,7 @@ def pallet_add():
         msg += '.'
     msg += pipeline_msg
     flash(msg, 'success')
-    return redirect(url_for('pallet_detail', pallet_id=pallet_id) if imported > 0 else url_for('pallets_list'))
+    return redirect(url_for('pallet_detail', pallet_id=pallet_id) if (imported > 0 or merged_into_existing) else url_for('pallets_list'))
 
 
 @app.route('/pallet/<int:pallet_id>/delete', methods=['POST'])
@@ -486,6 +519,80 @@ def pallet_delete(pallet_id):
     execute_db("DELETE FROM products WHERE pallet_id = ?", (pallet_id,))
     execute_db("DELETE FROM pallets WHERE id = ?", (pallet_id,))
     flash(f'Pallet "{pallet["name"]}" deleted.', 'success')
+    return redirect(url_for('pallets_list'))
+
+
+@app.route('/pallets/bulk-delete', methods=['POST'])
+def pallets_bulk_delete():
+    """Bulk-delete selected pallets + their products. JSON API, called from
+    the 'DELETE SELECTED' bar on /pallets (mirrors Akces Hub's pattern)."""
+    try:
+        data = request.get_json(silent=True) or {}
+        ids = data.get('ids', []) or []
+        if not ids:
+            return jsonify({'ok': False, 'error': 'No pallets selected'}), 400
+
+        deleted = 0
+        for pid in ids:
+            try:
+                pid_int = int(pid)
+            except (TypeError, ValueError):
+                continue
+            execute_db("DELETE FROM products WHERE pallet_id = ?", (pid_int,))
+            execute_db("DELETE FROM pallets WHERE id = ?", (pid_int,))
+            deleted += 1
+        return jsonify({'ok': True, 'deleted': deleted})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)[:200]}), 500
+
+
+@app.route('/pallets/merge-duplicates', methods=['POST'])
+def pallets_merge_duplicates():
+    """Consolidate pallets that share the same (name, supplier) into a single
+    pallet. Keeps the oldest one as canonical, moves all products into it,
+    and deletes the duplicates. Matching is case/whitespace insensitive so
+    "#3 MIX" and "#3 mix " collapse together."""
+    rows = query_db("""
+        SELECT id, LOWER(TRIM(name)) AS nkey,
+               LOWER(TRIM(COALESCE(supplier,''))) AS skey
+        FROM pallets
+        WHERE status = 'active'
+        ORDER BY id ASC
+    """)
+    # Group by (nkey, skey) → list of ids (ascending)
+    groups = {}
+    for r in rows:
+        key = (r['nkey'], r['skey'])
+        groups.setdefault(key, []).append(r['id'])
+
+    merged_groups = 0
+    merged_pallets = 0
+    moved_products = 0
+    for key, ids in groups.items():
+        if len(ids) < 2:
+            continue
+        canonical = ids[0]
+        dupes = ids[1:]
+        # Move products and listings then drop the duplicate pallets
+        for dup in dupes:
+            # Count before moving for the flash message
+            cnt = query_db("SELECT COUNT(*) AS c FROM products WHERE pallet_id = ?",
+                           (dup,), one=True)
+            moved_products += (cnt['c'] if cnt else 0)
+            execute_db("UPDATE products SET pallet_id = ? WHERE pallet_id = ?",
+                       (canonical, dup))
+            execute_db("DELETE FROM pallets WHERE id = ?", (dup,))
+            merged_pallets += 1
+        merged_groups += 1
+
+    if merged_groups == 0:
+        flash('No duplicate pallets found. Everything is already unique.', 'info')
+    else:
+        flash(
+            f'Merged {merged_pallets} duplicate pallet(s) into {merged_groups} canonical one(s). '
+            f'{moved_products} products moved.',
+            'success'
+        )
     return redirect(url_for('pallets_list'))
 
 
@@ -522,11 +629,116 @@ def pallet_set_domain(pallet_id):
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
+# ---------------------------------------------------------------------------
+# Background scrape jobs
+#
+# Why: scraping N products × up to 9 Amazon locales (auto-detect cascade) is
+# 30-300s of blocking work. Cloudflare times out HTTP at 100s (error 524),
+# so we cannot do this synchronously in a request handler. We also don't
+# want to add a task queue dependency (Celery/RQ) on a Raspberry Pi.
+#
+# Solution: fire a daemon thread per scrape, track progress in an in-memory
+# dict keyed by pallet_id, and expose /pallet/<id>/scrape-status for the UI
+# to poll. Progress is best-effort and resets on app restart — that's fine
+# because all writes go straight to SQLite, so even if the process dies
+# mid-scrape the partial work is preserved.
+# ---------------------------------------------------------------------------
+
+_scrape_jobs = {}  # pallet_id -> {status, total, done, updated, where, error, started_at}
+_scrape_lock = threading.Lock()
+
+
+def _run_pallet_scrape(pallet_id, override):
+    """Worker body that runs in a background thread.
+    IMPORTANT: this runs OUTSIDE any Flask request context, so it must
+    only use modules.database helpers (which are thread-safe via
+    thread-local connections) and never touch request/session/g."""
+    from modules.scraper import get_amazon_image_urls
+    import requests as _req
+
+    try:
+        products = query_db(
+            "SELECT * FROM products WHERE pallet_id = ? AND asin != ''",
+            (pallet_id,)
+        )
+        total = len(products)
+        with _scrape_lock:
+            _scrape_jobs[pallet_id]['total'] = total
+
+        if total == 0:
+            with _scrape_lock:
+                _scrape_jobs[pallet_id].update(
+                    status='done', where='', updated=0
+                )
+            return
+
+        updated = 0
+        detected_domain = None
+        # effective_override: starts as override; once we auto-detect the
+        # locale on product #1, reuse it for products 2..N so the cascade
+        # only runs once per pallet instead of N times.
+        effective_override = override
+
+        for i, prod in enumerate(products):
+            try:
+                amz_data = scrape_amazon_product(prod['asin'], effective_override)
+            except Exception:
+                amz_data = None
+
+            if amz_data and amz_data.get('image_url'):
+                new_name = amz_data.get('title') or prod['name']
+                new_image = amz_data['image_url']
+                new_price = amz_data.get('price') or prod['ebay_price_gbp']
+                images_json = json.dumps(amz_data.get('all_images', []))
+                specs_json = json.dumps(amz_data.get('item_specifics', {}))
+                execute_db(
+                    "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ?, images = ?, item_specifics = ? WHERE id = ?",
+                    (new_name, new_image, new_price, images_json, specs_json, prod['id'])
+                )
+                updated += 1
+                if not detected_domain:
+                    detected_domain = amz_data.get('source_domain')
+                    # Re-use the detected locale for remaining products
+                    if not effective_override and detected_domain:
+                        effective_override = detected_domain
+            else:
+                # Fallback: try static media.amazon.com image URLs (domain-agnostic)
+                for url in get_amazon_image_urls(prod['asin']):
+                    try:
+                        r = _req.head(url, timeout=5, allow_redirects=True)
+                        if r.status_code == 200 and 'image' in r.headers.get('content-type', ''):
+                            execute_db("UPDATE products SET image_url = ? WHERE id = ?", (url, prod['id']))
+                            updated += 1
+                            break
+                    except Exception:
+                        continue
+
+            with _scrape_lock:
+                _scrape_jobs[pallet_id].update(done=i + 1, updated=updated)
+
+        # Cache first auto-detected locale on the pallet so future scrapes skip the cascade
+        if not override and detected_domain:
+            execute_db("UPDATE pallets SET amazon_domain = ? WHERE id = ?", (detected_domain, pallet_id))
+
+        with _scrape_lock:
+            _scrape_jobs[pallet_id].update(
+                status='done',
+                where=(override or detected_domain or 'Amazon'),
+                updated=updated,
+            )
+    except Exception as e:
+        with _scrape_lock:
+            _scrape_jobs[pallet_id].update(status='error', error=str(e)[:300])
+
+
 @app.route('/pallet/<int:pallet_id>/scrape', methods=['POST'])
 def pallet_scrape(pallet_id):
-    """Scrape Amazon for all products with ASINs. If the pallet has an
-    explicit locale override, use that; otherwise auto-detect per-ASIN
-    and cache the first detected locale on the pallet."""
+    """Start a background scrape for all products with ASINs in this pallet.
+    Returns immediately with a flash message; the actual work runs in a
+    daemon thread. The UI can poll /pallet/<id>/scrape-status for progress.
+
+    This avoids Cloudflare 524 timeouts — the origin request finishes in
+    milliseconds, not minutes."""
     pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
     if not pallet:
         flash('Pallet not found.', 'error')
@@ -535,54 +747,50 @@ def pallet_scrape(pallet_id):
     # Empty -> auto-detect; set -> strict override
     override = (pallet.get('amazon_domain') or '').strip() or None
 
-    from modules.scraper import get_amazon_image_urls
-    import requests as _req
+    # Refuse to queue a second scrape while one is already running
+    with _scrape_lock:
+        existing = _scrape_jobs.get(pallet_id)
+        if existing and existing.get('status') == 'running':
+            flash('A scrape is already running for this pallet — check back in a moment.', 'info')
+            return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+        _scrape_jobs[pallet_id] = {
+            'status': 'running',
+            'total': 0,
+            'done': 0,
+            'updated': 0,
+            'where': '',
+            'error': '',
+            'started_at': time.time(),
+        }
 
-    products = query_db(
-        "SELECT * FROM products WHERE pallet_id = ? AND asin != ''",
-        (pallet_id,)
+    t = threading.Thread(
+        target=_run_pallet_scrape,
+        args=(pallet_id, override),
+        daemon=True,
     )
+    t.start()
 
-    if not products:
-        flash('No products with ASINs to scrape.', 'info')
-        return redirect(url_for('pallet_detail', pallet_id=pallet_id))
-
-    updated = 0
-    detected_domain = None
-    for prod in products:
-        amz_data = scrape_amazon_product(prod['asin'], override)
-        if amz_data and amz_data.get('image_url'):
-            new_name = amz_data.get('title') or prod['name']
-            new_image = amz_data['image_url']
-            new_price = amz_data.get('price') or prod['ebay_price_gbp']
-            images_json = json.dumps(amz_data.get('all_images', []))
-            specs_json = json.dumps(amz_data.get('item_specifics', {}))
-            execute_db(
-                "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ?, images = ?, item_specifics = ? WHERE id = ?",
-                (new_name, new_image, new_price, images_json, specs_json, prod['id'])
-            )
-            updated += 1
-            if not detected_domain:
-                detected_domain = amz_data.get('source_domain')
-        else:
-            # Fallback: try static image URL formats (these are domain-agnostic media.amazon.com URLs)
-            for url in get_amazon_image_urls(prod['asin']):
-                try:
-                    r = _req.head(url, timeout=5, allow_redirects=True)
-                    if r.status_code == 200 and 'image' in r.headers.get('content-type', ''):
-                        execute_db("UPDATE products SET image_url = ? WHERE id = ?", (url, prod['id']))
-                        updated += 1
-                        break
-                except:
-                    continue
-
-    # Cache first auto-detected locale on the pallet so future scrapes skip the cascade
-    if not override and detected_domain:
-        execute_db("UPDATE pallets SET amazon_domain = ? WHERE id = ?", (detected_domain, pallet_id))
-
-    where = override or detected_domain or 'Amazon'
-    flash(f'Updated {updated}/{len(products)} products from {where}.', 'success')
+    flash('Scrape started in the background. Progress will update on this page — no need to wait.', 'success')
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+
+
+@app.route('/pallet/<int:pallet_id>/scrape-status')
+def pallet_scrape_status(pallet_id):
+    """JSON status of the background scrape job for this pallet.
+    Returns {status, total, done, updated, where, error}. Frontend polls this
+    to show a progress bar without blocking the page."""
+    with _scrape_lock:
+        job = _scrape_jobs.get(pallet_id)
+        if not job:
+            return jsonify({'status': 'idle'})
+        return jsonify({
+            'status': job.get('status', 'idle'),
+            'total': job.get('total', 0),
+            'done': job.get('done', 0),
+            'updated': job.get('updated', 0),
+            'where': job.get('where', ''),
+            'error': job.get('error', ''),
+        })
 
 
 @app.route('/pallet/<int:pallet_id>/mass-price', methods=['POST'])
@@ -2188,8 +2396,27 @@ def dashboard():
 TEMPLATE_PALLETS_CONTENT = """
 <div class="page-header">
     <h1><span>Pallets</span></h1>
-    <button class="btn btn-cyan" onclick="document.getElementById('addPalletModal').classList.add('active')">
-        <span class="material-symbols-outlined">add</span> Add Pallet
+    <div class="d-flex gap-8">
+        <button type="button" id="bulk-select-btn" class="btn btn-outline btn-sm" onclick="toggleSelectAllPallets()">
+            <span class="material-symbols-outlined">check_box</span> Select All
+        </button>
+        <form method="POST" action="/pallets/merge-duplicates" class="inline-form"
+              onsubmit="return confirm('Find pallets with the same name+supplier and merge them into one? Products will be moved to the oldest pallet, and the duplicates will be deleted.')">
+            <button type="submit" class="btn btn-outline btn-sm" style="border-color:rgba(168,85,247,0.3);color:#a855f7">
+                <span class="material-symbols-outlined">merge</span> Merge Duplicates
+            </button>
+        </form>
+        <button class="btn btn-cyan" onclick="document.getElementById('addPalletModal').classList.add('active')">
+            <span class="material-symbols-outlined">add</span> Add Pallet
+        </button>
+    </div>
+</div>
+
+<!-- Sticky bulk-delete bar (shows when any pallet row is checked) -->
+<div id="bulk-delete-bar" style="display:none;position:sticky;top:0;z-index:50;background:linear-gradient(135deg,#ef4444,#dc2626);border-radius:10px;padding:12px 16px;margin-bottom:12px;align-items:center;justify-content:space-between;box-shadow:0 4px 15px rgba(239,68,68,0.4)">
+    <span style="color:#fff;font-weight:600;font-size:0.9rem" id="bulk-delete-count">0 selected</span>
+    <button type="button" onclick="bulkDeletePallets()" style="background:#fff;color:#dc2626;border:none;padding:8px 20px;border-radius:8px;font-weight:700;cursor:pointer;font-size:0.85rem">
+        <span class="material-symbols-outlined">delete</span> DELETE SELECTED
     </button>
 </div>
 
@@ -2198,6 +2425,7 @@ TEMPLATE_PALLETS_CONTENT = """
     <table>
         <thead>
             <tr>
+                <th style="width:36px"><input type="checkbox" id="header-select-all" onchange="toggleSelectAllPallets()"></th>
                 <th>Name</th>
                 <th>Supplier</th>
                 <th>Cost</th>
@@ -2210,7 +2438,8 @@ TEMPLATE_PALLETS_CONTENT = """
         </thead>
         <tbody>
             {% for p in pallets %}
-            <tr>
+            <tr id="pallet-row-{{ p.id }}">
+                <td><input type="checkbox" class="pallet-cb" value="{{ p.id }}" onchange="updateBulkDelete()"></td>
                 <td>
                     <a href="/pallet/{{ p.id }}" class="table-link">{{ p.name }}</a>
                 </td>
@@ -2242,6 +2471,56 @@ TEMPLATE_PALLETS_CONTENT = """
     </button>
 </div>
 {% endif %}
+
+<script>
+function updateBulkDelete() {
+    var checked = document.querySelectorAll('.pallet-cb:checked');
+    var bar = document.getElementById('bulk-delete-bar');
+    var count = document.getElementById('bulk-delete-count');
+    if (checked.length > 0) {
+        bar.style.display = 'flex';
+        count.textContent = checked.length + ' selected';
+    } else {
+        bar.style.display = 'none';
+    }
+}
+
+function toggleSelectAllPallets() {
+    var cbs = document.querySelectorAll('.pallet-cb');
+    var allChecked = [].every.call(cbs, function(cb){ return cb.checked; });
+    [].forEach.call(cbs, function(cb){ cb.checked = !allChecked; });
+    var hdr = document.getElementById('header-select-all');
+    if (hdr) hdr.checked = !allChecked;
+    updateBulkDelete();
+}
+
+function bulkDeletePallets() {
+    var checked = document.querySelectorAll('.pallet-cb:checked');
+    var ids = [].map.call(checked, function(cb){ return cb.value; });
+    if (ids.length === 0) return;
+    if (!confirm('Delete ' + ids.length + ' pallets with all their products? This cannot be undone!')) return;
+
+    fetch('/pallets/bulk-delete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ids: ids})
+    })
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+        if (data.ok) {
+            ids.forEach(function(id){
+                var row = document.getElementById('pallet-row-' + id);
+                if (row) row.remove();
+            });
+            updateBulkDelete();
+            location.reload();
+        } else {
+            alert('Error: ' + (data.error || 'Unknown'));
+        }
+    })
+    .catch(function(e){ alert('Error: ' + e); });
+}
+</script>
 
 <!-- Add Pallet Modal -->
 <div id="addPalletModal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('active')">
@@ -2380,6 +2659,59 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
         </form>
     </div>
 </div>
+
+<!-- Background-scrape progress bar (hidden unless a job is running for this pallet).
+     Polls /pallet/<id>/scrape-status every 2s; reloads when the job finishes so the
+     newly scraped images/titles appear without a manual refresh. -->
+<div id="scrape-progress" style="display:none;background:linear-gradient(135deg,rgba(0,255,136,0.12),rgba(6,182,212,0.12));border:1px solid rgba(0,255,136,0.35);border-radius:10px;padding:12px 16px;margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="color:#00ff88;font-weight:600;font-size:0.9rem">
+            <span class="material-symbols-outlined" style="vertical-align:middle;font-size:1.1rem">sync</span>
+            Scraping Amazon <span id="scrape-progress-label">...</span>
+        </span>
+        <span id="scrape-progress-count" style="color:rgba(255,255,255,0.7);font-size:0.8rem">0 / 0</span>
+    </div>
+    <div style="background:rgba(0,0,0,0.3);border-radius:6px;height:8px;overflow:hidden">
+        <div id="scrape-progress-bar" style="background:linear-gradient(90deg,#00ff88,#06b6d4);height:100%;width:0%;transition:width 0.3s"></div>
+    </div>
+</div>
+<script>
+(function(){
+    var palletId = {{ pallet.id }};
+    var bar = document.getElementById('scrape-progress');
+    var label = document.getElementById('scrape-progress-label');
+    var count = document.getElementById('scrape-progress-count');
+    var fill = document.getElementById('scrape-progress-bar');
+    var wasRunning = false;
+
+    function poll() {
+        fetch('/pallet/' + palletId + '/scrape-status')
+            .then(function(r){ return r.json(); })
+            .then(function(j){
+                if (j.status === 'running') {
+                    wasRunning = true;
+                    bar.style.display = 'block';
+                    count.textContent = (j.done || 0) + ' / ' + (j.total || '?');
+                    label.textContent = '(' + (j.updated || 0) + ' updated)';
+                    var pct = j.total ? Math.round((j.done / j.total) * 100) : 5;
+                    fill.style.width = pct + '%';
+                } else if (j.status === 'done') {
+                    if (wasRunning) { location.reload(); }
+                    else { bar.style.display = 'none'; }
+                } else if (j.status === 'error') {
+                    bar.style.display = 'block';
+                    label.textContent = 'ERROR: ' + (j.error || 'Unknown');
+                    fill.style.background = '#ef4444';
+                } else {
+                    bar.style.display = 'none';
+                }
+            })
+            .catch(function(){});
+    }
+    poll();
+    setInterval(poll, 2000);
+})();
+</script>
 
 <!-- Pallet Stats -->
 <div class="stats-grid">
