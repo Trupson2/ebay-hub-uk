@@ -23,7 +23,11 @@ from modules.database import (
     get_config, set_config,
     query_db, execute_db
 )
-from modules.ebay_api import get_ebay_client
+from modules.ebay_api import (
+    get_ebay_client,
+    get_shipping_options_grouped,
+    validate_shipping_fit,
+)
 from modules.scraper import scrape_amazon_product, parse_specification, get_amazon_image_url
 
 # ---------------------------------------------------------------------------
@@ -606,7 +610,8 @@ def pallet_publish_all(pallet_id):
 
     drafts = query_db(
         """SELECT l.*, p.image_url, p.images, p.condition, p.quantity, p.ean, p.id as prod_id,
-                  p.shipping_method, p.shipping_cost_gbp, p.category, p.item_specifics as prod_specs
+                  p.shipping_method, p.shipping_cost_gbp, p.category, p.item_specifics as prod_specs,
+                  p.weight_kg, p.length_cm, p.width_cm, p.height_cm
            FROM ebay_listings l
            JOIN products p ON p.id = l.product_id
            WHERE p.pallet_id = ? AND l.status = 'draft'""",
@@ -652,6 +657,20 @@ def pallet_publish_all(pallet_id):
             # Use product-specific shipping or defaults
             prod_shipping = draft.get('shipping_method') or shipping_key
             prod_shipping_cost = draft.get('shipping_cost_gbp') or 0
+
+            # Validate weight / dimensions against shipping method
+            fit_ok, fit_err = validate_shipping_fit(
+                prod_shipping,
+                weight_kg=draft.get('weight_kg'),
+                length_cm=draft.get('length_cm'),
+                width_cm=draft.get('width_cm'),
+                height_cm=draft.get('height_cm'),
+            )
+            if not fit_ok:
+                failed += 1
+                errors.append(f"{draft['title'][:40]}: {fit_err}")
+                continue
+
             # Category from listing or product (format: "id:name" or just "id")
             _cat = (draft.get('category_id') or draft.get('category') or '175673').split(':')[0]
             result = ebay.create_listing({
@@ -860,6 +879,19 @@ def list_on_ebay(product_id):
     shipping_cost = product.get('shipping_cost_gbp') or 0
     return_days = int(get_config('default_return_days', '30') or '30')
     cat = (product.get('category') or '175673').split(':')[0]
+
+    # Validate product fits the shipping method (weight + dimensions).
+    # Missing data = pass — only block when we KNOW it won't fit.
+    fit_ok, fit_err = validate_shipping_fit(
+        shipping_key,
+        weight_kg=product.get('weight_kg'),
+        length_cm=product.get('length_cm'),
+        width_cm=product.get('width_cm'),
+        height_cm=product.get('height_cm'),
+    )
+    if not fit_ok:
+        flash(f'Cannot publish — {fit_err}', 'error')
+        return redirect(url_for('product_detail', product_id=product_id))
 
     # Use all images if available
     image_urls = []
@@ -2676,56 +2708,15 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
                     <label class="form-label">Shipping Method</label>
                     <select name="shipping_method" class="form-control">
                         <option value="" {{ 'selected' if not product.shipping_method }}>Use default (Settings)</option>
-                        <optgroup label="Royal Mail — Domestic">
-                            <option value="royal_mail_2nd" {{ 'selected' if product.shipping_method == 'royal_mail_2nd' }}>Royal Mail 2nd Class</option>
-                            <option value="royal_mail_1st" {{ 'selected' if product.shipping_method == 'royal_mail_1st' }}>Royal Mail 1st Class</option>
-                            <option value="royal_mail_signed_2nd" {{ 'selected' if product.shipping_method == 'royal_mail_signed_2nd' }}>Royal Mail Signed For 2nd Class</option>
-                            <option value="royal_mail_signed_1st" {{ 'selected' if product.shipping_method == 'royal_mail_signed_1st' }}>Royal Mail Signed For 1st Class</option>
-                            <option value="royal_mail_tracked_48" {{ 'selected' if product.shipping_method == 'royal_mail_tracked_48' }}>Royal Mail Tracked 48</option>
-                            <option value="royal_mail_tracked_24" {{ 'selected' if product.shipping_method == 'royal_mail_tracked_24' }}>Royal Mail Tracked 24</option>
-                            <option value="royal_mail_tracked" {{ 'selected' if product.shipping_method == 'royal_mail_tracked' }}>Royal Mail Tracked (legacy)</option>
-                            <option value="royal_mail_special" {{ 'selected' if product.shipping_method == 'royal_mail_special' }}>Royal Mail Special Delivery (next day 1pm)</option>
-                            <option value="royal_mail_special_9am" {{ 'selected' if product.shipping_method == 'royal_mail_special_9am' }}>Royal Mail Special Delivery 9am</option>
+                        {% for group_label, items in shipping_groups %}
+                        <optgroup label="{{ group_label }}">
+                            {% for key, label in items %}
+                            <option value="{{ key }}" {{ 'selected' if product.shipping_method == key }}>{{ label }}</option>
+                            {% endfor %}
                         </optgroup>
-                        <optgroup label="Royal Mail — International">
-                            <option value="royal_mail_intl" {{ 'selected' if product.shipping_method == 'royal_mail_intl' }}>Royal Mail International Standard</option>
-                            <option value="royal_mail_intl_signed" {{ 'selected' if product.shipping_method == 'royal_mail_intl_signed' }}>Royal Mail International Signed</option>
-                            <option value="royal_mail_intl_tracked" {{ 'selected' if product.shipping_method == 'royal_mail_intl_tracked' }}>Royal Mail International Tracked & Signed</option>
-                        </optgroup>
-                        <optgroup label="Parcelforce (up to 30 kg)">
-                            <option value="parcelforce_48" {{ 'selected' if product.shipping_method == 'parcelforce_48' }}>Parcelforce 48</option>
-                            <option value="parcelforce_24" {{ 'selected' if product.shipping_method == 'parcelforce_24' }}>Parcelforce 24</option>
-                            <option value="parcelforce_express_10" {{ 'selected' if product.shipping_method == 'parcelforce_express_10' }}>Parcelforce Express 10</option>
-                            <option value="parcelforce_express_9" {{ 'selected' if product.shipping_method == 'parcelforce_express_9' }}>Parcelforce Express 9</option>
-                        </optgroup>
-                        <optgroup label="Couriers (Evri / DPD / Yodel / UPS / DHL / FedEx)">
-                            <option value="hermes" {{ 'selected' if product.shipping_method == 'hermes' }}>Evri (Standard)</option>
-                            <option value="evri_next_day" {{ 'selected' if product.shipping_method == 'evri_next_day' }}>Evri Next Day</option>
-                            <option value="dpd" {{ 'selected' if product.shipping_method == 'dpd' }}>DPD</option>
-                            <option value="dpd_next_day" {{ 'selected' if product.shipping_method == 'dpd_next_day' }}>DPD Next Day</option>
-                            <option value="yodel" {{ 'selected' if product.shipping_method == 'yodel' }}>Yodel</option>
-                            <option value="ups" {{ 'selected' if product.shipping_method == 'ups' }}>UPS (up to 70 kg)</option>
-                            <option value="ups_next_day" {{ 'selected' if product.shipping_method == 'ups_next_day' }}>UPS Next Day</option>
-                            <option value="ups_expedited" {{ 'selected' if product.shipping_method == 'ups_expedited' }}>UPS Expedited (heavy intl)</option>
-                            <option value="dhl" {{ 'selected' if product.shipping_method == 'dhl' }}>DHL (up to 70 kg)</option>
-                            <option value="dhl_express" {{ 'selected' if product.shipping_method == 'dhl_express' }}>DHL Express Worldwide</option>
-                            <option value="fedex" {{ 'selected' if product.shipping_method == 'fedex' }}>FedEx</option>
-                            <option value="tnt_express" {{ 'selected' if product.shipping_method == 'tnt_express' }}>TNT Express (now FedEx)</option>
-                            <option value="inpost" {{ 'selected' if product.shipping_method == 'inpost' }}>InPost UK (lockers)</option>
-                            <option value="apc_overnight" {{ 'selected' if product.shipping_method == 'apc_overnight' }}>APC Overnight</option>
-                            <option value="amazon_shipping" {{ 'selected' if product.shipping_method == 'amazon_shipping' }}>Amazon Shipping</option>
-                        </optgroup>
-                        <optgroup label="Large / Heavy / Pallets">
-                            <option value="tuffnells" {{ 'selected' if product.shipping_method == 'tuffnells' }}>Tuffnells (heavy / oversized)</option>
-                            <option value="palletways" {{ 'selected' if product.shipping_method == 'palletways' }}>Palletways (pallet)</option>
-                            <option value="palletforce" {{ 'selected' if product.shipping_method == 'palletforce' }}>Palletforce (pallet)</option>
-                            <option value="freight_other" {{ 'selected' if product.shipping_method == 'freight_other' }}>Other freight / oversized</option>
-                        </optgroup>
-                        <optgroup label="Other">
-                            <option value="collect" {{ 'selected' if product.shipping_method == 'collect' }}>Collection Only</option>
-                            <option value="seller_choice" {{ 'selected' if product.shipping_method == 'seller_choice' }}>Let eBay choose (seller choice)</option>
-                        </optgroup>
+                        {% endfor %}
                     </select>
+                    <div class="form-hint">Limits (max weight / dimensions) shown next to each option.</div>
                 </div>
                 <div class="form-group">
                     <label class="form-label">Shipping Cost (GBP)</label>
@@ -2926,7 +2917,8 @@ def product_detail(product_id):
         TEMPLATE_PRODUCT_DETAIL_CONTENT,
         page_title=f'{product["name"]} - eBay Hub UK',
         active_page='pallets',
-        product=product, pallet=pallet, listings=listings, sales=sales, draft=draft
+        product=product, pallet=pallet, listings=listings, sales=sales, draft=draft,
+        shipping_groups=get_shipping_options_grouped(),
     )
 
 
@@ -3291,55 +3283,13 @@ TEMPLATE_SETTINGS_CONTENT = """
             <div class="form-group">
                 <label class="form-label">Default Shipping Method</label>
                 <select name="default_shipping" class="form-control">
-                    <optgroup label="Royal Mail — Domestic">
-                        <option value="royal_mail_2nd" {{ 'selected' if config.default_shipping == 'royal_mail_2nd' }}>Royal Mail 2nd Class</option>
-                        <option value="royal_mail_1st" {{ 'selected' if config.default_shipping == 'royal_mail_1st' }}>Royal Mail 1st Class</option>
-                        <option value="royal_mail_signed_2nd" {{ 'selected' if config.default_shipping == 'royal_mail_signed_2nd' }}>Royal Mail Signed For 2nd Class</option>
-                        <option value="royal_mail_signed_1st" {{ 'selected' if config.default_shipping == 'royal_mail_signed_1st' }}>Royal Mail Signed For 1st Class</option>
-                        <option value="royal_mail_tracked_48" {{ 'selected' if config.default_shipping == 'royal_mail_tracked_48' }}>Royal Mail Tracked 48</option>
-                        <option value="royal_mail_tracked_24" {{ 'selected' if config.default_shipping == 'royal_mail_tracked_24' }}>Royal Mail Tracked 24</option>
-                        <option value="royal_mail_tracked" {{ 'selected' if config.default_shipping == 'royal_mail_tracked' }}>Royal Mail Tracked (legacy)</option>
-                        <option value="royal_mail_special" {{ 'selected' if config.default_shipping == 'royal_mail_special' }}>Royal Mail Special Delivery (next day 1pm)</option>
-                        <option value="royal_mail_special_9am" {{ 'selected' if config.default_shipping == 'royal_mail_special_9am' }}>Royal Mail Special Delivery 9am</option>
+                    {% for group_label, items in shipping_groups %}
+                    <optgroup label="{{ group_label }}">
+                        {% for key, label in items %}
+                        <option value="{{ key }}" {{ 'selected' if config.default_shipping == key }}>{{ label }}</option>
+                        {% endfor %}
                     </optgroup>
-                    <optgroup label="Royal Mail — International">
-                        <option value="royal_mail_intl" {{ 'selected' if config.default_shipping == 'royal_mail_intl' }}>Royal Mail International Standard</option>
-                        <option value="royal_mail_intl_signed" {{ 'selected' if config.default_shipping == 'royal_mail_intl_signed' }}>Royal Mail International Signed</option>
-                        <option value="royal_mail_intl_tracked" {{ 'selected' if config.default_shipping == 'royal_mail_intl_tracked' }}>Royal Mail International Tracked & Signed</option>
-                    </optgroup>
-                    <optgroup label="Parcelforce (up to 30 kg)">
-                        <option value="parcelforce_48" {{ 'selected' if config.default_shipping == 'parcelforce_48' }}>Parcelforce 48</option>
-                        <option value="parcelforce_24" {{ 'selected' if config.default_shipping == 'parcelforce_24' }}>Parcelforce 24</option>
-                        <option value="parcelforce_express_10" {{ 'selected' if config.default_shipping == 'parcelforce_express_10' }}>Parcelforce Express 10</option>
-                        <option value="parcelforce_express_9" {{ 'selected' if config.default_shipping == 'parcelforce_express_9' }}>Parcelforce Express 9</option>
-                    </optgroup>
-                    <optgroup label="Couriers (Evri / DPD / Yodel / UPS / DHL / FedEx)">
-                        <option value="hermes" {{ 'selected' if config.default_shipping == 'hermes' }}>Evri (Standard)</option>
-                        <option value="evri_next_day" {{ 'selected' if config.default_shipping == 'evri_next_day' }}>Evri Next Day</option>
-                        <option value="dpd" {{ 'selected' if config.default_shipping == 'dpd' }}>DPD</option>
-                        <option value="dpd_next_day" {{ 'selected' if config.default_shipping == 'dpd_next_day' }}>DPD Next Day</option>
-                        <option value="yodel" {{ 'selected' if config.default_shipping == 'yodel' }}>Yodel</option>
-                        <option value="ups" {{ 'selected' if config.default_shipping == 'ups' }}>UPS (up to 70 kg)</option>
-                        <option value="ups_next_day" {{ 'selected' if config.default_shipping == 'ups_next_day' }}>UPS Next Day</option>
-                        <option value="ups_expedited" {{ 'selected' if config.default_shipping == 'ups_expedited' }}>UPS Expedited (heavy intl)</option>
-                        <option value="dhl" {{ 'selected' if config.default_shipping == 'dhl' }}>DHL (up to 70 kg)</option>
-                        <option value="dhl_express" {{ 'selected' if config.default_shipping == 'dhl_express' }}>DHL Express Worldwide</option>
-                        <option value="fedex" {{ 'selected' if config.default_shipping == 'fedex' }}>FedEx</option>
-                        <option value="tnt_express" {{ 'selected' if config.default_shipping == 'tnt_express' }}>TNT Express (now FedEx)</option>
-                        <option value="inpost" {{ 'selected' if config.default_shipping == 'inpost' }}>InPost UK (lockers)</option>
-                        <option value="apc_overnight" {{ 'selected' if config.default_shipping == 'apc_overnight' }}>APC Overnight</option>
-                        <option value="amazon_shipping" {{ 'selected' if config.default_shipping == 'amazon_shipping' }}>Amazon Shipping</option>
-                    </optgroup>
-                    <optgroup label="Large / Heavy / Pallets">
-                        <option value="tuffnells" {{ 'selected' if config.default_shipping == 'tuffnells' }}>Tuffnells (heavy / oversized)</option>
-                        <option value="palletways" {{ 'selected' if config.default_shipping == 'palletways' }}>Palletways (pallet)</option>
-                        <option value="palletforce" {{ 'selected' if config.default_shipping == 'palletforce' }}>Palletforce (pallet)</option>
-                        <option value="freight_other" {{ 'selected' if config.default_shipping == 'freight_other' }}>Other freight / oversized</option>
-                    </optgroup>
-                    <optgroup label="Other">
-                        <option value="collect" {{ 'selected' if config.default_shipping == 'collect' }}>Collection Only</option>
-                        <option value="seller_choice" {{ 'selected' if config.default_shipping == 'seller_choice' }}>Let eBay choose (seller choice)</option>
-                    </optgroup>
+                    {% endfor %}
                 </select>
             </div>
             <div class="form-group">
@@ -3468,7 +3418,8 @@ def settings():
         page_title='Settings - eBay Hub UK',
         active_page='settings',
         config=config,
-        backups=backups
+        backups=backups,
+        shipping_groups=get_shipping_options_grouped(),
     )
 
 

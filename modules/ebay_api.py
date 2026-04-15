@@ -29,61 +29,290 @@ CONDITION_MAP = {
     'damaged': '7000',
 }
 
-# Shipping service mapping (config key -> eBay ShippingService name, default cost GBP)
+# Shipping service mapping.
+# Each entry: key -> dict with label, ebay_service, default_cost (GBP),
+# max_weight_kg (None = unlimited), max_dims_cm (None = unlimited, else tuple
+# of 3 sides in cm — product must fit in any orientation), group (see
+# SHIPPING_GROUPS), notes.
 SHIPPING_SERVICE_MAP = {
     # --- Royal Mail (domestic) ---
-    'royal_mail_2nd':         ('UK_RoyalMailSecondClassStandard',                2.99),
-    'royal_mail_1st':         ('UK_RoyalMailFirstClassStandard',                 3.99),
-    'royal_mail_signed_2nd':  ('UK_RoyalMailSecondClassRecorded',                4.19),
-    'royal_mail_signed_1st':  ('UK_RoyalMailFirstClassRecordedRecordedDelivery', 5.19),
-    'royal_mail_tracked_48':  ('UK_RoyalMailTracked48',                          4.49),
-    'royal_mail_tracked_24':  ('UK_RoyalMailTracked24',                          5.49),
-    # Legacy key — kept for backwards compat with existing product records.
-    # Remapped from international airmail (wrong) to Tracked 48 (intended).
-    'royal_mail_tracked':     ('UK_RoyalMailTracked48',                          4.49),
-    'royal_mail_special':     ('UK_RoyalMailSpecialDeliveryNextDay',             8.99),
-    'royal_mail_special_9am': ('UK_RoyalMailSpecialDelivery9am',                15.99),
+    'royal_mail_2nd': {
+        'label': 'Royal Mail 2nd Class', 'ebay_service': 'UK_RoyalMailSecondClassStandard',
+        'default_cost': 2.99, 'max_weight_kg': 2.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
+    'royal_mail_1st': {
+        'label': 'Royal Mail 1st Class', 'ebay_service': 'UK_RoyalMailFirstClassStandard',
+        'default_cost': 3.99, 'max_weight_kg': 2.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
+    'royal_mail_signed_2nd': {
+        'label': 'Royal Mail Signed For 2nd Class', 'ebay_service': 'UK_RoyalMailSecondClassRecorded',
+        'default_cost': 4.19, 'max_weight_kg': 2.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
+    'royal_mail_signed_1st': {
+        'label': 'Royal Mail Signed For 1st Class', 'ebay_service': 'UK_RoyalMailFirstClassRecordedRecordedDelivery',
+        'default_cost': 5.19, 'max_weight_kg': 2.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
+    'royal_mail_tracked_48': {
+        'label': 'Royal Mail Tracked 48', 'ebay_service': 'UK_RoyalMailTracked48',
+        'default_cost': 4.49, 'max_weight_kg': 20.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
+    'royal_mail_tracked_24': {
+        'label': 'Royal Mail Tracked 24', 'ebay_service': 'UK_RoyalMailTracked24',
+        'default_cost': 5.49, 'max_weight_kg': 20.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
+    # Legacy key — kept for backwards compat. Remapped from intl airmail -> Tracked 48.
+    'royal_mail_tracked': {
+        'label': 'Royal Mail Tracked (legacy)', 'ebay_service': 'UK_RoyalMailTracked48',
+        'default_cost': 4.49, 'max_weight_kg': 20.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
+    'royal_mail_special': {
+        'label': 'Royal Mail Special Delivery (next day 1pm)', 'ebay_service': 'UK_RoyalMailSpecialDeliveryNextDay',
+        'default_cost': 8.99, 'max_weight_kg': 20.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
+    'royal_mail_special_9am': {
+        'label': 'Royal Mail Special Delivery 9am', 'ebay_service': 'UK_RoyalMailSpecialDelivery9am',
+        'default_cost': 15.99, 'max_weight_kg': 20.0, 'max_dims_cm': (61, 46, 46),
+        'group': 'rm_domestic', 'notes': '',
+    },
 
     # --- Royal Mail (international) ---
-    'royal_mail_intl':         ('UK_RoyalMailAirmailInternational',          6.99),
-    'royal_mail_intl_signed':  ('UK_RoyalMailInternationalSignedFor',       10.99),
-    'royal_mail_intl_tracked': ('UK_RoyalMailInternationalTrackedAndSigned', 12.99),
+    'royal_mail_intl': {
+        'label': 'Royal Mail International Standard', 'ebay_service': 'UK_RoyalMailAirmailInternational',
+        'default_cost': 6.99, 'max_weight_kg': 2.0, 'max_dims_cm': (60, 60, 90),
+        'group': 'rm_intl', 'notes': '',
+    },
+    'royal_mail_intl_signed': {
+        'label': 'Royal Mail International Signed', 'ebay_service': 'UK_RoyalMailInternationalSignedFor',
+        'default_cost': 10.99, 'max_weight_kg': 2.0, 'max_dims_cm': (60, 60, 90),
+        'group': 'rm_intl', 'notes': '',
+    },
+    'royal_mail_intl_tracked': {
+        'label': 'Royal Mail International Tracked & Signed', 'ebay_service': 'UK_RoyalMailInternationalTrackedAndSigned',
+        'default_cost': 12.99, 'max_weight_kg': 2.0, 'max_dims_cm': (60, 60, 90),
+        'group': 'rm_intl', 'notes': '',
+    },
 
-    # --- Parcelforce ---
-    'parcelforce_48':        ('UK_ParcelForce48',         7.99),
-    'parcelforce_24':        ('UK_ParcelForce24',        10.99),
-    'parcelforce_express_10': ('UK_ParcelForceExpress10', 15.99),
-    'parcelforce_express_9':  ('UK_ParcelForceExpress9',  19.99),
+    # --- Parcelforce (up to 30 kg single parcel) ---
+    'parcelforce_48': {
+        'label': 'Parcelforce 48', 'ebay_service': 'UK_ParcelForce48',
+        'default_cost': 7.99, 'max_weight_kg': 30.0, 'max_dims_cm': None,
+        'group': 'parcelforce', 'notes': 'longest side 1.5 m',
+    },
+    'parcelforce_24': {
+        'label': 'Parcelforce 24', 'ebay_service': 'UK_ParcelForce24',
+        'default_cost': 10.99, 'max_weight_kg': 30.0, 'max_dims_cm': None,
+        'group': 'parcelforce', 'notes': 'longest side 1.5 m',
+    },
+    'parcelforce_express_10': {
+        'label': 'Parcelforce Express 10', 'ebay_service': 'UK_ParcelForceExpress10',
+        'default_cost': 15.99, 'max_weight_kg': 30.0, 'max_dims_cm': None,
+        'group': 'parcelforce', 'notes': 'longest side 1.5 m',
+    },
+    'parcelforce_express_9': {
+        'label': 'Parcelforce Express 9', 'ebay_service': 'UK_ParcelForceExpress9',
+        'default_cost': 19.99, 'max_weight_kg': 30.0, 'max_dims_cm': None,
+        'group': 'parcelforce', 'notes': 'longest side 1.5 m',
+    },
 
     # --- Couriers (eBay accepts them under UK_OtherCourier + speed tier) ---
-    'hermes':          ('UK_OtherCourier',   3.49),  # legacy key = Evri Standard
-    'evri_next_day':   ('UK_OtherCourier24', 5.49),
-    'dpd':             ('UK_OtherCourier',   5.99),
-    'dpd_next_day':    ('UK_OtherCourier24', 7.99),
-    'yodel':           ('UK_OtherCourier',   4.99),
-    'ups':             ('UK_OtherCourier',   8.99),
-    'ups_next_day':    ('UK_OtherCourier24',12.99),
-    'dhl':             ('UK_OtherCourier',   9.99),
-    'fedex':           ('UK_OtherCourier',   9.99),
-    'inpost':          ('UK_OtherCourier48', 3.99),  # InPost UK lockers
-    'apc_overnight':   ('UK_OtherCourier24', 8.99),
-    'amazon_shipping': ('UK_OtherCourier',   4.99),
-    'tuffnells':       ('UK_OtherCourier',  14.99),  # heavy/oversized (up to 30kg+)
+    'hermes': {  # legacy key = Evri Standard
+        'label': 'Evri (Standard)', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 3.49, 'max_weight_kg': 15.0, 'max_dims_cm': (120, 45, 45),
+        'group': 'courier', 'notes': '',
+    },
+    'evri_next_day': {
+        'label': 'Evri Next Day', 'ebay_service': 'UK_OtherCourier24',
+        'default_cost': 5.49, 'max_weight_kg': 15.0, 'max_dims_cm': (120, 45, 45),
+        'group': 'courier', 'notes': '',
+    },
+    'dpd': {
+        'label': 'DPD', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 5.99, 'max_weight_kg': 30.0, 'max_dims_cm': (175, 100, 70),
+        'group': 'courier', 'notes': '',
+    },
+    'dpd_next_day': {
+        'label': 'DPD Next Day', 'ebay_service': 'UK_OtherCourier24',
+        'default_cost': 7.99, 'max_weight_kg': 30.0, 'max_dims_cm': (175, 100, 70),
+        'group': 'courier', 'notes': '',
+    },
+    'yodel': {
+        'label': 'Yodel', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 4.99, 'max_weight_kg': 20.0, 'max_dims_cm': (180, 60, 60),
+        'group': 'courier', 'notes': '',
+    },
+    'ups': {
+        'label': 'UPS', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 8.99, 'max_weight_kg': 70.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '270 cm girth',
+    },
+    'ups_next_day': {
+        'label': 'UPS Next Day', 'ebay_service': 'UK_OtherCourier24',
+        'default_cost': 12.99, 'max_weight_kg': 70.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '270 cm girth',
+    },
+    'ups_expedited': {
+        'label': 'UPS Expedited (heavy intl)', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 14.99, 'max_weight_kg': 70.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '270 cm girth',
+    },
+    'dhl': {
+        'label': 'DHL', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 9.99, 'max_weight_kg': 70.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '',
+    },
+    'dhl_express': {
+        'label': 'DHL Express Worldwide', 'ebay_service': 'UK_OtherCourier24',
+        'default_cost': 14.99, 'max_weight_kg': 70.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '',
+    },
+    'fedex': {
+        'label': 'FedEx', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 9.99, 'max_weight_kg': 68.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '',
+    },
+    'tnt_express': {
+        'label': 'TNT Express (now FedEx)', 'ebay_service': 'UK_OtherCourier24',
+        'default_cost': 12.99, 'max_weight_kg': 68.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '',
+    },
+    'inpost': {
+        'label': 'InPost UK (lockers)', 'ebay_service': 'UK_OtherCourier48',
+        'default_cost': 3.99, 'max_weight_kg': 25.0, 'max_dims_cm': (64, 41, 38),
+        'group': 'courier', 'notes': 'locker size C',
+    },
+    'apc_overnight': {
+        'label': 'APC Overnight', 'ebay_service': 'UK_OtherCourier24',
+        'default_cost': 8.99, 'max_weight_kg': 30.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '',
+    },
+    'amazon_shipping': {
+        'label': 'Amazon Shipping', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 4.99, 'max_weight_kg': 30.0, 'max_dims_cm': None,
+        'group': 'courier', 'notes': '',
+    },
 
-    # --- Large / heavy / freight (bigger than standard parcel) ---
-    # Parcelforce + DPD/UPS/DHL above already cover up to 30-70 kg single parcel.
-    # Below: pallet deliveries and freight (100 kg+).
-    'palletways':    ('UK_Freight',  49.99),  # 1/4, 1/2 or full pallet
-    'palletforce':   ('UK_Freight',  49.99),  # alternative pallet network
-    'tnt_express':   ('UK_OtherCourier24', 12.99),  # now FedEx Express, legacy name
-    'ups_expedited': ('UK_OtherCourier',  14.99),  # UPS Expedited (heavy intl)
-    'dhl_express':   ('UK_OtherCourier24',14.99),  # DHL Express Worldwide
-    'freight_other': ('UK_Freight',  39.99),  # generic freight / oversized
+    # --- Large / heavy / pallets ---
+    'tuffnells': {
+        'label': 'Tuffnells (heavy / oversized)', 'ebay_service': 'UK_OtherCourier',
+        'default_cost': 14.99, 'max_weight_kg': 75.0, 'max_dims_cm': None,
+        'group': 'large', 'notes': 'oversized OK',
+    },
+    'palletways': {
+        'label': 'Palletways (pallet)', 'ebay_service': 'UK_Freight',
+        'default_cost': 49.99, 'max_weight_kg': 1000.0, 'max_dims_cm': None,
+        'group': 'large', 'notes': 'pallet 100-1000 kg',
+    },
+    'palletforce': {
+        'label': 'Palletforce (pallet)', 'ebay_service': 'UK_Freight',
+        'default_cost': 49.99, 'max_weight_kg': 1000.0, 'max_dims_cm': None,
+        'group': 'large', 'notes': 'pallet 100-1000 kg',
+    },
+    'freight_other': {
+        'label': 'Other freight / oversized', 'ebay_service': 'UK_Freight',
+        'default_cost': 39.99, 'max_weight_kg': 1000.0, 'max_dims_cm': None,
+        'group': 'large', 'notes': 'freight',
+    },
 
     # --- Other ---
-    'collect':       ('UK_CollectInPerson', 0.00),
-    'seller_choice': ('UK_SellerChoice',    0.00),  # let eBay pick based on weight
+    'collect': {
+        'label': 'Collection Only', 'ebay_service': 'UK_CollectInPerson',
+        'default_cost': 0.00, 'max_weight_kg': None, 'max_dims_cm': None,
+        'group': 'other', 'notes': 'no delivery — buyer picks up',
+    },
+    'seller_choice': {
+        'label': 'Let eBay choose (seller choice)', 'ebay_service': 'UK_SellerChoice',
+        'default_cost': 0.00, 'max_weight_kg': None, 'max_dims_cm': None,
+        'group': 'other', 'notes': 'eBay picks based on weight',
+    },
 }
+
+# Display order for dropdowns (group_key, display_label).
+SHIPPING_GROUPS = [
+    ('rm_domestic', 'Royal Mail — Domestic'),
+    ('rm_intl',     'Royal Mail — International'),
+    ('parcelforce', 'Parcelforce (up to 30 kg)'),
+    ('courier',     'Couriers (Evri / DPD / Yodel / UPS / DHL / FedEx)'),
+    ('large',       'Large / Heavy / Pallets'),
+    ('other',       'Other'),
+]
+
+
+def get_shipping_method(key):
+    """Get shipping method config by key. Falls back to royal_mail_2nd."""
+    return SHIPPING_SERVICE_MAP.get(key) or SHIPPING_SERVICE_MAP['royal_mail_2nd']
+
+
+def format_shipping_option_label(key):
+    """Build dropdown label with weight/size/notes constraints appended."""
+    m = SHIPPING_SERVICE_MAP.get(key)
+    if not m:
+        return key
+    parts = []
+    if m.get('max_weight_kg'):
+        parts.append(f"max {m['max_weight_kg']:g} kg")
+    if m.get('max_dims_cm'):
+        d = m['max_dims_cm']
+        parts.append(f"{d[0]}\u00d7{d[1]}\u00d7{d[2]} cm")
+    if m.get('notes'):
+        parts.append(m['notes'])
+    if parts:
+        return f"{m['label']}  \u2014  {', '.join(parts)}"
+    return m['label']
+
+
+def get_shipping_options_grouped():
+    """Return [(group_label, [(key, display_label), ...]), ...] for rendering dropdowns."""
+    out = []
+    for group_key, group_label in SHIPPING_GROUPS:
+        items = [(k, format_shipping_option_label(k))
+                 for k, m in SHIPPING_SERVICE_MAP.items() if m.get('group') == group_key]
+        if items:
+            out.append((group_label, items))
+    return out
+
+
+def validate_shipping_fit(shipping_key, weight_kg=None, length_cm=None, width_cm=None, height_cm=None):
+    """
+    Check if a product fits the shipping method's weight + dimension limits.
+    Returns (ok: bool, error_msg: str | None). Missing product data = pass.
+    """
+    m = SHIPPING_SERVICE_MAP.get(shipping_key)
+    if not m:
+        return True, None  # unknown key, don't block
+
+    # Weight check
+    max_w = m.get('max_weight_kg')
+    try:
+        w = float(weight_kg) if weight_kg else 0.0
+    except (TypeError, ValueError):
+        w = 0.0
+    if max_w and w and w > max_w:
+        return False, (f"{m['label']}: max {max_w:g} kg, product weighs {w:g} kg. "
+                       f"Pick a courier for heavier parcels (e.g. Parcelforce / UPS / DHL / pallet).")
+
+    # Dimension check — product must fit in any orientation.
+    max_dims = m.get('max_dims_cm')
+    try:
+        dims = [float(length_cm or 0), float(width_cm or 0), float(height_cm or 0)]
+    except (TypeError, ValueError):
+        dims = [0.0, 0.0, 0.0]
+    if max_dims and all(d > 0 for d in dims):
+        prod_sorted = sorted(dims, reverse=True)
+        max_sorted = sorted(max_dims, reverse=True)
+        if any(p > mx for p, mx in zip(prod_sorted, max_sorted)):
+            return False, (f"{m['label']}: max {max_dims[0]}\u00d7{max_dims[1]}\u00d7{max_dims[2]} cm, "
+                           f"product is {int(dims[0])}\u00d7{int(dims[1])}\u00d7{int(dims[2])} cm. "
+                           f"Pick a larger courier.")
+
+    return True, None
 
 
 class EbayAPI:
@@ -223,9 +452,9 @@ class EbayAPI:
         condition_id = CONDITION_MAP.get(condition, '3000')
 
         # Shipping
-        shipping_service, default_cost = SHIPPING_SERVICE_MAP.get(
-            shipping_key, ('UK_RoyalMailSecondClassStandard', 2.99)
-        )
+        method = get_shipping_method(shipping_key)
+        shipping_service = method['ebay_service']
+        default_cost = method['default_cost']
         shipping_cost = product_data.get('shipping_cost', default_cost)
 
         # Build PictureURL elements
