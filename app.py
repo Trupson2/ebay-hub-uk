@@ -4010,12 +4010,185 @@ def backup_upload():
 # ===================================================================
 
 TEMPLATE_HELP = """
-<div class="page-header"><h1><span>Help & Guide</span></h1></div>
+<div class="page-header">
+    <h1><span>Help & Guide</span></h1>
+    <div style="display:flex;gap:8px;margin-left:auto">
+        <button id="lang-pl" class="btn btn-lime btn-sm" onclick="setLang('pl')">Polski</button>
+        <button id="lang-en" class="btn btn-outline btn-sm" onclick="setLang('en')">English</button>
+    </div>
+</div>
+
+<style>
+.help-lang { display: none; }
+.help-lang.active { display: block; }
+</style>
+
+<script>
+function setLang(lang) {
+    document.querySelectorAll('.help-lang').forEach(function(el){
+        el.classList.toggle('active', el.dataset.lang === lang);
+    });
+    var plBtn = document.getElementById('lang-pl');
+    var enBtn = document.getElementById('lang-en');
+    if (lang === 'pl') {
+        plBtn.className = 'btn btn-lime btn-sm';
+        enBtn.className = 'btn btn-outline btn-sm';
+    } else {
+        plBtn.className = 'btn btn-outline btn-sm';
+        enBtn.className = 'btn btn-lime btn-sm';
+    }
+    try { localStorage.setItem('ebayhub_help_lang', lang); } catch(e){}
+}
+(function(){
+    var saved = 'pl';
+    try { saved = localStorage.getItem('ebayhub_help_lang') || 'pl'; } catch(e){}
+    setLang(saved);
+})();
+</script>
+
+<!-- =================================================================== -->
+<!-- POLSKI                                                                -->
+<!-- =================================================================== -->
+<div class="help-lang" data-lang="pl">
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#8ff5ff">Od czego zacząć — krok po kroku</div>
+    <ol style="line-height:2.2;color:var(--text-muted);font-size:0.9rem">
+        <li><strong>Dodaj paletę:</strong> Wejdź w <strong>Pallets</strong> → <strong>+ Add Pallet</strong> → wpisz nazwę, cenę zakupu (GBP) i dostawcę. Wgraj plik CSV/XLSX/ODS od dostawcy palety.</li>
+        <li><strong>Auto Pipeline:</strong> Na stronie palety kliknij <strong>Auto Pipeline</strong> — apka sama:
+            <ul style="margin:4px 0 4px 20px;line-height:1.8">
+                <li>Pobierze do 8 zdjęć każdego produktu z Amazon UK</li>
+                <li>Wyciągnie specyfikację (marka, model, rozmiar itd.)</li>
+                <li>Wygeneruje tytuły pod eBay przez AI (max 80 znaków)</li>
+                <li>Wygeneruje profesjonalny opis HTML przez AI</li>
+                <li>Dopasuje kategorię eBay</li>
+                <li>Zrobi szkice aukcji gotowe do podglądu</li>
+            </ul>
+        </li>
+        <li><strong>Ustaw ceny:</strong> W sekcji <strong>Set Prices</strong> wpisz ręcznie albo kliknij <strong>Apply Multiplier</strong> (np. koszt × 2.5 = twoja cena sprzedaży).</li>
+        <li><strong>Sprawdź szkice:</strong> Wejdź w <strong>Listings</strong> → kliknij produkt żeby edytować tytuł/opis/cenę.</li>
+        <li><strong>Wystaw:</strong> Wróć na paletę → kliknij <strong>Publish All</strong> → aukcje idą NA ŻYWO na eBay (zostaniesz zapytany o potwierdzenie).</li>
+        <li><strong>Wyślij zamówienie:</strong> Gdy coś się sprzeda → <strong>Orders</strong> → <strong>Mark as Shipped</strong> + numer śledzenia.</li>
+    </ol>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#beee00">Własne zdjęcia — ważne!</div>
+    <p style="color:var(--text-muted);font-size:0.9rem;line-height:1.8">
+        Amazon czasem pokazuje inny wariant produktu niż to co faktycznie jest w palecie
+        (np. na Amazonie jest biała choinka, a w palecie zielona). Dlatego możesz dodać
+        <strong>własne zdjęcia</strong> tego co naprawdę masz.
+    </p>
+    <ol style="line-height:2;color:var(--text-muted);font-size:0.9rem">
+        <li>Wejdź w produkt (Pallets → paleta → produkt)</li>
+        <li>Sekcja <strong>Your Photos</strong> — kliknij <strong>Choose Files</strong> i wybierz zdjęcia z telefonu/dysku</li>
+        <li>Kliknij <strong>Upload</strong> — twoje zdjęcia pójdą jako <strong>pierwsze</strong> zarówno w karuzeli na stronie jak i w aukcji eBay</li>
+        <li>Możesz usunąć każde zdjęcie osobno — ikona kosza pod zdjęciem</li>
+    </ol>
+    <p style="color:var(--warning);font-size:0.85rem;margin-top:8px">
+        <strong>Uwaga:</strong> jeżeli apka wykryje że Amazon mówi co innego niż dostawca
+        (np. inny kolor), zobaczysz żółte ostrzeżenie na górze strony produktu. Wtedy koniecznie
+        zrób własne zdjęcia — AI też uwzględni opis od dostawcy jako prawdę.
+    </p>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#f59e0b">Sprzedaż prywatna — jak dodać</div>
+    <p style="color:var(--text-muted);font-size:0.9rem;line-height:1.8">
+        Jeżeli sprzedałeś coś <strong>poza eBayem</strong> (znajomemu, na targu, za gotówkę w ręce) —
+        wpisz to w apce, żeby przychód był kompletny na dashboardzie.
+    </p>
+    <ol style="line-height:2;color:var(--text-muted);font-size:0.9rem">
+        <li>Wejdź w produkt (Pallets → paleta → produkt)</li>
+        <li>Przewiń w dół — sekcja <strong>Sprzedaż prywatna</strong> (nad Edit Product)</li>
+        <li>Wpisz <strong>cenę</strong> (GBP) — już wstępnie uzupełniona ceną z eBay, popraw jeśli sprzedałeś taniej</li>
+        <li>Opcjonalnie: kto kupił (np. „Janek kolega") i notatka (np. „zapłacił gotówką")</li>
+        <li>Zaznacz ✅ <strong>Already handed over</strong> jeśli już oddałeś towar kupującemu</li>
+        <li>Kliknij <strong>Record private sale</strong> — potwierdź kwotę</li>
+    </ol>
+    <p style="color:var(--text-muted);font-size:0.85rem;margin-top:8px">
+        <strong>Co się stanie:</strong> sprzedaż pojawi się w <strong>Orders</strong> z oznaczeniem
+        <span class="badge" style="background:rgba(190,238,0,0.15);color:var(--lime);border:1px solid rgba(190,238,0,0.3)">PRIVATE</span>,
+        produkt zostanie oznaczony jako sprzedany, a kwota wejdzie do Total Revenue na dashboardzie.
+        Jeżeli już wcześniej ręcznie ustawiłeś status na „Sold" ale nie wpisałeś sprzedaży — sekcja
+        nadal się pokaże z żółtym ostrzeżeniem, żeby można było uzupełnić wstecznie.
+    </p>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#a855f7">Przyciski — co który robi</div>
+    <div style="display:grid;grid-template-columns:170px 1fr;gap:10px 16px;font-size:0.85rem;color:var(--text-muted)">
+        <div><span class="btn btn-purple btn-sm" style="font-size:0.7rem">Import CSV</span></div><div>Wgraj plik CSV/XLSX/ODS z produktami od dostawcy palety</div>
+        <div><span class="btn btn-sm" style="font-size:0.7rem;background:linear-gradient(135deg,#8ff5ff,#a855f7);color:#000">Auto Pipeline</span></div><div><strong>Robi wszystko automatycznie!</strong> Zdjęcia, tytuły, opisy, kategorie, szkice — jednym kliknięciem</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#f59e0b;color:#f59e0b">Create Drafts</span></div><div>Zapisuje aukcje lokalnie — nic nie idzie jeszcze na eBay. Sprawdź przed publikacją</div>
+        <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Publish All</span></div><div>Wystawia wszystkie szkice na eBay NA ŻYWO! <strong>Upewnij się najpierw że ceny są ustawione!</strong></div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#a855f7;color:#a855f7">Auto Categories</span></div><div>AI dopasowuje kategorie eBay do twoich produktów</div>
+        <div><span class="btn btn-cyan btn-sm" style="font-size:0.7rem">Scrape Images</span></div><div>Pobiera ponownie zdjęcia produktów z Amazon UK</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Save Draft</span></div><div>Zapisuje tytuł, opis, cenę bez wystawiania na eBay</div>
+        <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Publish to eBay</span></div><div>Wystawia ten jeden produkt na eBay (od razu na żywo)</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Title</span></div><div>AI generuje zoptymalizowany tytuł (max 80 znaków, po angielsku)</div>
+        <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Description</span></div><div>AI generuje profesjonalny opis HTML z listą cech i bulletami</div>
+        <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Record private sale</span></div><div>Zapisuje sprzedaż prywatną (poza eBayem) — wchodzi do przychodu</div>
+    </div>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#ff6b9b">Wysyłka — jak to działa</div>
+    <p style="color:var(--text-muted);font-size:0.85rem;line-height:1.8">
+        Gdy ktoś kupi twój produkt na eBay:<br><br>
+        <strong>1.</strong> Zobaczysz zamówienie w zakładce <strong>Orders</strong> ze statusem <strong>„TO SHIP"</strong><br>
+        <strong>2.</strong> Zapakuj produkt starannie<br>
+        <strong>3.</strong> Zanieś na pocztę (Royal Mail) albo do punktu (Evri, DPD)<br>
+        <strong>4.</strong> Weź numer śledzenia od kuriera<br>
+        <strong>5.</strong> W apce kliknij <strong>Mark as Shipped</strong> i wpisz numer śledzenia<br>
+        <strong>6.</strong> eBay przeleje ci pieniądze na konto (zwykle 2-3 dni po potwierdzeniu odbioru przez kupującego)<br><br>
+        <strong style="color:#8ff5ff">Tip:</strong> Tańsze etykiety wysyłkowe kupisz bezpośrednio na eBay!<br>
+        Wejdź: My eBay → Sold → Print Shipping Label — eBay ma zniżki z Royal Mail i Evri.<br><br>
+        <strong style="color:#8ff5ff">Tip:</strong> Ustaw koszt wysyłki <strong>£0 (free postage)</strong> i wlicz go w cenę produktu — eBay wyżej pokazuje aukcje z darmową wysyłką!
+    </p>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#f59e0b">Wskazówki jak sprzedawać więcej</div>
+    <ul style="color:var(--text-muted);font-size:0.85rem;line-height:2.2">
+        <li>Używaj <strong>darmowej wysyłki</strong> (£0) — eBay wyżej rankuje takie aukcje</li>
+        <li>Używaj <strong>Auto Pipeline</strong> — AI generuje profesjonalne tytuły/opisy, oszczędzasz godziny pracy</li>
+        <li>Dodaj <strong>dużo zdjęć</strong> — aukcje z 8+ fotkami mają 30% więcej sprzedaży na eBay UK</li>
+        <li>Ustaw <strong>konkurencyjne ceny</strong> — sprawdź za ile podobne rzeczy poszły na eBay</li>
+        <li>Wysyłaj <strong>w ciągu 1-2 dni</strong> — szybka wysyłka poprawia ocenę i ranking</li>
+        <li>Zawsze podawaj <strong>numer śledzenia</strong> — chroni cię przed reklamacjami „nie doszło"</li>
+        <li>Pisz tytuły ze <strong>słowami kluczowymi</strong> (marka, model, najważniejsze parametry)</li>
+        <li>Nowe konta: eBay może <strong>trzymać pieniądze kilka dni</strong> — to normalne, po paru sprzedażach przestaje</li>
+    </ul>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#ef4444">Typowe problemy</div>
+    <div style="color:var(--text-muted);font-size:0.85rem;line-height:1.8">
+        <p><strong>Błąd 120 — „Need additional information":</strong><br>Twoje konto sprzedawcy eBay nie jest do końca skonfigurowane. Wejdź na <a href="https://www.ebay.co.uk/sh/sell" target="_blank" style="color:#8ff5ff">ebay.co.uk/sh/sell</a> i dokończ dane bankowe + weryfikację tożsamości.</p>
+        <p style="margin-top:12px"><strong>Błąd 107 — „Category not valid":</strong><br>Złe ID kategorii. Wejdź w produkt → zmień pole Category na prawidłowy numer kategorii eBay UK (np. 96915 dla ładowarek, 175673 dla części komputerowych).</p>
+        <p style="margin-top:12px"><strong>Ostrzeżenie — „Funds on hold":</strong><br>To normalne dla nowych sprzedawców. eBay trzyma pieniądze dopóki kupujący nie potwierdzi dostawy. Po kilku udanych sprzedażach przestaje.</p>
+        <p style="margin-top:12px"><strong>Nie pokazują się zdjęcia:</strong><br>Kliknij <strong>Scrape Images</strong> na stronie palety albo odpal <strong>Auto Pipeline</strong> jeszcze raz.</p>
+        <p style="margin-top:12px"><strong>Żółte ostrzeżenie o kolorze na stronie produktu:</strong><br>Amazon pokazuje inny wariant niż dostawca. Wgraj własne zdjęcia w sekcji <strong>Your Photos</strong> — AI użyje opisu od dostawcy jako prawdy.</p>
+    </div>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title">Potrzebujesz pomocy?</div>
+    <p style="color:var(--text-muted);font-size:0.85rem">Zadzwoń do Adriana. Ma zdalny dostęp do apki i może naprawić każdy problem.</p>
+</div>
+
+</div><!-- /PL -->
+
+<!-- =================================================================== -->
+<!-- ENGLISH                                                               -->
+<!-- =================================================================== -->
+<div class="help-lang" data-lang="en">
 
 <div class="card mb-16">
     <div class="card-title" style="color:#8ff5ff">Quick Start — The Easy Way</div>
     <ol style="line-height:2.2;color:var(--text-muted);font-size:0.9rem">
-        <li><strong>Add a pallet:</strong> Go to <strong>Pallets</strong> → <strong>+ Add Pallet</strong> → fill in name, price (GBP), supplier. Upload your CSV/XLSX file from the joblot supplier.</li>
+        <li><strong>Add a pallet:</strong> Go to <strong>Pallets</strong> → <strong>+ Add Pallet</strong> → fill in name, price (GBP), supplier. Upload your CSV/XLSX/ODS file from the joblot supplier.</li>
         <li><strong>Auto Pipeline:</strong> Click <strong>Auto Pipeline</strong> on the pallet page → the app automatically:
             <ul style="margin:4px 0 4px 20px;line-height:1.8">
                 <li>Downloads up to 8 product images from Amazon UK</li>
@@ -4026,7 +4199,7 @@ TEMPLATE_HELP = """
                 <li>Creates draft listings ready for review</li>
             </ul>
         </li>
-        <li><strong>Set prices:</strong> Use the <strong>Set Prices</strong> section → type prices manually or click <strong>Apply Multiplier</strong> (e.g. cost x 2.5 = your selling price).</li>
+        <li><strong>Set prices:</strong> Use the <strong>Set Prices</strong> section → type prices manually or click <strong>Apply Multiplier</strong> (e.g. cost × 2.5 = your selling price).</li>
         <li><strong>Review drafts:</strong> Go to <strong>Listings</strong> → check your drafts. Click on a product to edit title, description, or price.</li>
         <li><strong>Publish:</strong> Go back to the pallet → click <strong>Publish All</strong> → listings go LIVE on eBay (you'll be asked to confirm).</li>
         <li><strong>Ship orders:</strong> When something sells → go to <strong>Orders</strong> → click <strong>Mark as Shipped</strong> with the tracking number.</li>
@@ -4034,9 +4207,52 @@ TEMPLATE_HELP = """
 </div>
 
 <div class="card mb-16">
-    <div class="card-title" style="color:#beee00">Buttons Explained</div>
+    <div class="card-title" style="color:#beee00">Your own photos — important!</div>
+    <p style="color:var(--text-muted);font-size:0.9rem;line-height:1.8">
+        Amazon sometimes shows a different variant than what's actually in your pallet
+        (e.g. Amazon lists a white Christmas tree, but the pallet contains the green one).
+        That's why you can upload <strong>your own photos</strong> of what you really have.
+    </p>
+    <ol style="line-height:2;color:var(--text-muted);font-size:0.9rem">
+        <li>Open the product page (Pallets → pallet → product)</li>
+        <li>Section <strong>Your Photos</strong> — click <strong>Choose Files</strong> and pick photos from your phone/disk</li>
+        <li>Click <strong>Upload</strong> — your photos will appear <strong>first</strong> in both the carousel and in the eBay listing</li>
+        <li>You can delete individual photos — trash icon below each one</li>
+    </ol>
+    <p style="color:var(--warning);font-size:0.85rem;margin-top:8px">
+        <strong>Note:</strong> if the app detects a disagreement between Amazon and the supplier
+        (e.g. different colour), you'll see a yellow warning at the top of the product page.
+        Upload your own photos — the AI will also trust the supplier description over Amazon.
+    </p>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#f59e0b">Private sale — how to record it</div>
+    <p style="color:var(--text-muted);font-size:0.9rem;line-height:1.8">
+        If you sold something <strong>outside eBay</strong> (to a friend, at a local market,
+        cash in hand) — record it in the app so the revenue on the dashboard is complete.
+    </p>
+    <ol style="line-height:2;color:var(--text-muted);font-size:0.9rem">
+        <li>Open the product page (Pallets → pallet → product)</li>
+        <li>Scroll down — section <strong>Sprzedaż prywatna</strong> (above Edit Product)</li>
+        <li>Enter the <strong>price</strong> (GBP) — pre-filled with the eBay price, adjust if you sold cheaper</li>
+        <li>Optional: who bought it (e.g. "John — friend") and notes (e.g. "paid cash")</li>
+        <li>Tick ✅ <strong>Already handed over</strong> if you already gave the item to the buyer</li>
+        <li>Click <strong>Record private sale</strong> — confirm the amount</li>
+    </ol>
+    <p style="color:var(--text-muted);font-size:0.85rem;margin-top:8px">
+        <strong>What happens:</strong> the sale appears in <strong>Orders</strong> tagged
+        <span class="badge" style="background:rgba(190,238,0,0.15);color:var(--lime);border:1px solid rgba(190,238,0,0.3)">PRIVATE</span>,
+        the product is marked as sold, and the amount flows into Total Revenue on the dashboard.
+        If you previously set the status to "Sold" manually but never recorded a sale — the
+        section still shows with a yellow warning so you can backfill the revenue.
+    </p>
+</div>
+
+<div class="card mb-16">
+    <div class="card-title" style="color:#a855f7">Buttons Explained</div>
     <div style="display:grid;grid-template-columns:170px 1fr;gap:10px 16px;font-size:0.85rem;color:var(--text-muted)">
-        <div><span class="btn btn-purple btn-sm" style="font-size:0.7rem">Import CSV</span></div><div>Upload CSV/XLSX file with products from your joblot supplier</div>
+        <div><span class="btn btn-purple btn-sm" style="font-size:0.7rem">Import CSV</span></div><div>Upload CSV/XLSX/ODS file with products from your joblot supplier</div>
         <div><span class="btn btn-sm" style="font-size:0.7rem;background:linear-gradient(135deg,#8ff5ff,#a855f7);color:#000">Auto Pipeline</span></div><div><strong>Does everything automatically!</strong> Images, titles, descriptions, categories, drafts — one click</div>
         <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem;border-color:#f59e0b;color:#f59e0b">Create Drafts</span></div><div>Save listings locally — nothing goes to eBay yet. Review before publishing</div>
         <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Publish All</span></div><div>Send all drafts to eBay — listings go LIVE immediately! <strong>Make sure prices are set first!</strong></div>
@@ -4046,6 +4262,7 @@ TEMPLATE_HELP = """
         <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Publish to eBay</span></div><div>Send this single product to eBay (goes live immediately)</div>
         <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Title</span></div><div>AI creates an optimized eBay title (max 80 characters, English)</div>
         <div><span class="btn btn-outline btn-sm" style="font-size:0.7rem">Generate Description</span></div><div>AI creates a professional HTML description with features and bullet points</div>
+        <div><span class="btn btn-lime btn-sm" style="font-size:0.7rem">Record private sale</span></div><div>Record a sale made outside eBay — still counts toward revenue</div>
     </div>
 </div>
 
@@ -4086,6 +4303,7 @@ TEMPLATE_HELP = """
         <p style="margin-top:12px"><strong>Error 107 — "Category not valid":</strong><br>The matched category ID is wrong. Click on the product → change the Category field to a valid eBay UK category number (e.g. 96915 for Chargers, 175673 for Computer Parts).</p>
         <p style="margin-top:12px"><strong>Warning — "Funds on hold":</strong><br>This is normal for new sellers. eBay holds money until the buyer confirms delivery. After a few successful sales, this stops.</p>
         <p style="margin-top:12px"><strong>No images showing:</strong><br>Click <strong>Scrape Images</strong> on the pallet page, or run <strong>Auto Pipeline</strong> again.</p>
+        <p style="margin-top:12px"><strong>Yellow colour-warning banner on product page:</strong><br>Amazon shows a different variant than the supplier. Upload your own photos in the <strong>Your Photos</strong> section — the AI will use the supplier description as the source of truth.</p>
     </div>
 </div>
 
@@ -4093,6 +4311,8 @@ TEMPLATE_HELP = """
     <div class="card-title">Need Help?</div>
     <p style="color:var(--text-muted);font-size:0.85rem">Contact Adrian for technical support. He can access the app remotely and fix any issues.</p>
 </div>
+
+</div><!-- /EN -->
 """
 
 @app.route('/help')
