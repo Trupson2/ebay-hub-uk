@@ -118,8 +118,24 @@ def init_db():
         ('products', 'shipping_pricing_mode', "TEXT DEFAULT ''"),
         ('products', 'images', "TEXT DEFAULT ''"),
         ('products', 'item_specifics', "TEXT DEFAULT ''"),
+        # Supplier ground-truth description from CSV/ODS "Product Description" column.
+        # Used as the primary source of truth for what is physically in the pallet —
+        # Amazon variant metadata can describe a different colour/variant (see the
+        # Busybee Christmas Tree case: Amazon says Colour:Champagne + Light Color:
+        # Warm white, supplier says "Green Artificial Tree, Green Wire String Lights").
+        ('products', 'supplier_description', "TEXT DEFAULT ''"),
+        # JSON array of locally-uploaded image paths (relative to /static, e.g.
+        # "uploads/products/42/abc.jpg"). Shown before Amazon images in the gallery
+        # and prepended to eBay listings. Lets the uncle override wrong variant
+        # photos with his own shots of the actual pallet contents.
+        ('products', 'custom_images', "TEXT DEFAULT ''"),
         ('ebay_listings', 'category_id', "TEXT DEFAULT ''"),
         ('ebay_listings', 'item_specifics', "TEXT DEFAULT ''"),
+        # sales.source: 'ebay' for orders synced from eBay API, 'private' for
+        # items the uncle sold in person / to a friend / cash-in-hand — still
+        # needs to count toward his revenue and profit on the dashboard.
+        ('sales', 'source', "TEXT DEFAULT 'ebay'"),
+        ('sales', 'notes', "TEXT DEFAULT ''"),
     ]
     for table, col, col_type in _migrations:
         try:

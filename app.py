@@ -385,7 +385,15 @@ def pallet_add():
                 return ''
 
             for row in rows:
-                prod_name = get_col(row, 'name', 'title', 'product', 'nazwa', 'description')
+                prod_name = get_col(row, 'name', 'title', 'product', 'nazwa')
+                # Supplier description — ground truth about what's physically in the
+                # pallet. Kept separate from the name so the name matches Amazon title
+                # (for matching/dedup) while the description drives AI generation.
+                supplier_desc = get_col(row, 'product description', 'description', 'opis')
+                # If neither name nor title matched but we have a description, fall back
+                # to it for the name so we still have something.
+                if not prod_name:
+                    prod_name = supplier_desc
                 if not prod_name:
                     continue
                 asin = get_col(row, 'asin').upper()
@@ -421,8 +429,10 @@ def pallet_add():
 
                 execute_db(
                     "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
-                    "condition, ebay_price_gbp, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (pallet_id, prod_name, asin, ean, qty, cond, ebay_price, image_url)
+                    "condition, ebay_price_gbp, image_url, supplier_description) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (pallet_id, prod_name, asin, ean, qty, cond, ebay_price, image_url,
+                     supplier_desc)
                 )
                 imported += 1
         except Exception as e:
@@ -609,7 +619,8 @@ def pallet_publish_all(pallet_id):
         return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
     drafts = query_db(
-        """SELECT l.*, p.image_url, p.images, p.condition, p.quantity, p.ean, p.id as prod_id,
+        """SELECT l.*, p.image_url, p.images, p.custom_images, p.condition, p.quantity,
+                  p.ean, p.id as prod_id,
                   p.shipping_method, p.shipping_cost_gbp, p.shipping_pricing_mode,
                   p.category, p.item_specifics as prod_specs,
                   p.weight_kg, p.length_cm, p.width_cm, p.height_cm
@@ -618,6 +629,9 @@ def pallet_publish_all(pallet_id):
            WHERE p.pallet_id = ? AND l.status = 'draft'""",
         (pallet_id,)
     )
+    # Resolve the public base URL once per batch — used to turn custom image
+    # paths into absolute URLs that eBay can fetch from the outside.
+    _custom_img_base = (get_config('public_base_url', '') or request.host_url or '').rstrip('/')
 
     if not drafts:
         flash('No drafts to publish.', 'info')
@@ -639,16 +653,25 @@ def pallet_publish_all(pallet_id):
             errors.append(f"{draft['title'][:40]}: no price")
             continue
 
-        # Use all images if available, fallback to single image
+        # Custom (uploaded) photos first, then Amazon. Caps at eBay's 12-picture limit.
         image_urls = []
         try:
+            custom_rels = json.loads(draft.get('custom_images') or '[]')
+            if isinstance(custom_rels, list) and _custom_img_base:
+                for rel in custom_rels:
+                    image_urls.append(f'{_custom_img_base}/static/{rel}')
+        except (json.JSONDecodeError, TypeError):
+            pass
+        try:
             all_imgs = json.loads(draft.get('images') or '[]')
-            if all_imgs:
-                image_urls = all_imgs[:12]
+            for url in all_imgs:
+                if url and url not in image_urls:
+                    image_urls.append(url)
         except (json.JSONDecodeError, TypeError):
             pass
         if not image_urls and draft.get('image_url'):
             image_urls = [draft['image_url']]
+        image_urls = image_urls[:12]
 
         # Parse item specifics from listing or product
         listing_specs = {}
@@ -835,6 +858,213 @@ def product_delete(product_id):
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
 
+# ---------------------------------------------------------------------------
+# Custom images + colour-mismatch detection
+# ---------------------------------------------------------------------------
+
+# Minimal English colour vocabulary used to cross-check Amazon metadata against
+# the supplier's ground-truth Product Description. Kept narrow on purpose —
+# we're flagging pallet-seller confusion (Busybee: Amazon=Champagne/Warm white,
+# supplier=Green), not doing general NLP. Multi-word terms first so
+# "warm white" matches as one unit before being split on "white".
+COLOUR_WORDS = (
+    'warm white', 'cool white', 'cream white', 'off white', 'navy blue',
+    'sky blue', 'rose gold',
+    'red', 'orange', 'yellow', 'green', 'blue', 'purple', 'pink',
+    'brown', 'black', 'white', 'grey', 'gray', 'silver', 'gold',
+    'champagne', 'beige', 'cream', 'ivory', 'turquoise', 'cyan',
+    'magenta', 'maroon', 'navy', 'olive', 'teal', 'lime', 'tan',
+    'bronze', 'copper', 'pearl', 'charcoal',
+)
+
+# Colour words that are too generic to flag on their own — almost every
+# package mentions "white box" or "black text". Only raise the warning if a
+# STRONGER colour (non-neutral) mismatches.
+NEUTRAL_COLOURS = {'white', 'black', 'grey', 'gray', 'cream', 'ivory', 'beige'}
+
+
+def _extract_colours(text):
+    """Return a set of colour words found in free-form text (lowercased)."""
+    if not text:
+        return set()
+    lowered = ' ' + text.lower() + ' '
+    found = set()
+    # Replace matched terms with spaces so "warm white" doesn't also hit "white".
+    for word in COLOUR_WORDS:
+        needle = f' {word} '
+        if needle in lowered:
+            found.add(word)
+            lowered = lowered.replace(needle, ' ' * (len(needle)))
+    return found
+
+
+def detect_colour_mismatch(product):
+    """
+    Compare colour words in the supplier description against Amazon-derived
+    metadata (item_specifics + Amazon title stored in name). Returns None when
+    no meaningful mismatch, or a dict {supplier: [...], amazon: [...]} when
+    the two sources disagree on colour.
+    """
+    supplier_desc = (product.get('supplier_description') or '').strip()
+    if not supplier_desc:
+        return None
+
+    # Amazon side: name (Amazon title replaces supplier title when longer) + specs
+    amazon_text_parts = [product.get('name') or '']
+    specs_raw = product.get('item_specifics') or ''
+    try:
+        specs = json.loads(specs_raw) if specs_raw else {}
+        if isinstance(specs, dict):
+            for k, v in specs.items():
+                kl = k.lower()
+                if 'colour' in kl or 'color' in kl:
+                    amazon_text_parts.append(str(v))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    amazon_text = ' '.join(amazon_text_parts)
+
+    supplier_colours = _extract_colours(supplier_desc)
+    amazon_colours = _extract_colours(amazon_text)
+
+    if not supplier_colours or not amazon_colours:
+        return None
+
+    # Overlap = at least one shared colour → no mismatch to flag.
+    if supplier_colours & amazon_colours:
+        return None
+
+    # Require at least one NON-neutral colour on each side. Without that we're
+    # just flagging "white box" vs "black ink" kind of noise.
+    supplier_strong = supplier_colours - NEUTRAL_COLOURS
+    amazon_strong = amazon_colours - NEUTRAL_COLOURS
+    if not supplier_strong and not amazon_strong:
+        return None
+
+    return {
+        'supplier': sorted(supplier_colours),
+        'amazon': sorted(amazon_colours),
+    }
+
+
+UPLOAD_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'static', 'uploads', 'products')
+ALLOWED_IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+MAX_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MB per file — eBay's own cap is ~12 MB
+
+
+def _product_image_dir(product_id):
+    d = os.path.join(UPLOAD_ROOT, str(int(product_id)))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _load_custom_images(product):
+    try:
+        data = json.loads(product.get('custom_images') or '[]')
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+@app.route('/product/<int:product_id>/upload-images', methods=['POST'])
+def product_upload_images(product_id):
+    """Upload user-supplied product photos. Files are stored in
+    static/uploads/products/<id>/ and their relative paths appended to the
+    product's custom_images JSON array."""
+    product = query_db("SELECT * FROM products WHERE id = ?", (product_id,), one=True)
+    if not product:
+        flash('Product not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    files = request.files.getlist('images')
+    if not files:
+        flash('No files selected.', 'error')
+        return redirect(url_for('product_detail', product_id=product_id))
+
+    saved = _load_custom_images(product)
+    dest_dir = _product_image_dir(product_id)
+    added = 0
+    rejected = 0
+
+    for f in files:
+        if not f or not f.filename:
+            continue
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in ALLOWED_IMAGE_EXT:
+            rejected += 1
+            continue
+        # Enforce size by seeking — Flask doesn't cap uploads by default here.
+        f.stream.seek(0, io.SEEK_END)
+        size = f.stream.tell()
+        f.stream.seek(0)
+        if size > MAX_IMAGE_BYTES or size == 0:
+            rejected += 1
+            continue
+        # UUID-ish filename, preserving extension. Avoids collisions and strips
+        # any path tricks from the original filename.
+        token = secrets.token_hex(8)
+        fname = f'{token}{ext}'
+        path = os.path.join(dest_dir, fname)
+        try:
+            f.save(path)
+        except Exception as e:
+            print(f'[UPLOAD] save failed for {fname}: {e}')
+            rejected += 1
+            continue
+        rel = f'uploads/products/{int(product_id)}/{fname}'
+        saved.append(rel)
+        added += 1
+
+    execute_db(
+        "UPDATE products SET custom_images = ? WHERE id = ?",
+        (json.dumps(saved), product_id)
+    )
+    if added:
+        flash(f'Uploaded {added} photo{"s" if added != 1 else ""}.' +
+              (f' {rejected} rejected (bad type or size).' if rejected else ''),
+              'success')
+    else:
+        flash(f'No photos uploaded. {rejected} rejected (bad type or size).', 'error')
+    return redirect(url_for('product_detail', product_id=product_id))
+
+
+@app.route('/product/<int:product_id>/delete-image', methods=['POST'])
+def product_delete_image(product_id):
+    """Remove one user-uploaded image. Expects form field 'path' with the
+    relative path stored in custom_images."""
+    product = query_db("SELECT * FROM products WHERE id = ?", (product_id,), one=True)
+    if not product:
+        flash('Product not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    target = (request.form.get('path') or '').strip()
+    if not target:
+        return redirect(url_for('product_detail', product_id=product_id))
+
+    # Defence-in-depth — only delete paths that belong to this product's folder.
+    expected_prefix = f'uploads/products/{int(product_id)}/'
+    if not target.startswith(expected_prefix) or '..' in target:
+        flash('Invalid image path.', 'error')
+        return redirect(url_for('product_detail', product_id=product_id))
+
+    saved = [p for p in _load_custom_images(product) if p != target]
+    execute_db(
+        "UPDATE products SET custom_images = ? WHERE id = ?",
+        (json.dumps(saved), product_id)
+    )
+
+    abs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static',
+                            target.replace('/', os.sep))
+    try:
+        if os.path.isfile(abs_path):
+            os.remove(abs_path)
+    except Exception as e:
+        print(f'[UPLOAD] delete failed for {target}: {e}')
+
+    flash('Photo removed.', 'success')
+    return redirect(url_for('product_detail', product_id=product_id))
+
+
 @app.route('/product/<int:product_id>/list_ebay', methods=['POST'])
 def list_on_ebay(product_id):
     product = query_db("SELECT * FROM products WHERE id = ?", (product_id,), one=True)
@@ -915,16 +1145,29 @@ def list_on_ebay(product_id):
         flash(f'Cannot publish — {fit_err}', 'error')
         return redirect(url_for('product_detail', product_id=product_id))
 
-    # Use all images if available
+    # Build the eBay image list. Custom (user-uploaded) photos come first —
+    # they're the actual pallet contents, not Amazon's variant stock shots.
+    # Then Amazon images fill any remaining slots up to eBay's 12-picture cap.
     image_urls = []
+    # Custom uploads — convert relative paths to absolute URLs eBay can fetch.
+    # Prefer the configured public URL (set when the app is behind ngrok on the
+    # Pi), fall back to request.host_url so dev/LAN setups still work.
+    custom_rels = _load_custom_images(product)
+    if custom_rels:
+        base = (get_config('public_base_url', '') or request.host_url or '').rstrip('/')
+        for rel in custom_rels:
+            if base:
+                image_urls.append(f'{base}/static/{rel}')
     try:
         all_imgs = json.loads(product.get('images') or '[]')
-        if all_imgs:
-            image_urls = all_imgs[:12]
+        for url in all_imgs:
+            if url and url not in image_urls:
+                image_urls.append(url)
     except (json.JSONDecodeError, TypeError):
         pass
     if not image_urls and product.get('image_url'):
         image_urls = [product['image_url']]
+    image_urls = image_urls[:12]
 
     # Parse item specifics
     prod_specs = {}
@@ -1007,6 +1250,49 @@ def api_add_sale():
 
     flash('Sale recorded.', 'success')
     return redirect(url_for('orders_list'))
+
+
+@app.route('/product/<int:product_id>/sell-private', methods=['POST'])
+def product_sell_private(product_id):
+    """Record a private sale — the uncle sold this item in person, to a friend,
+    at a local market, etc. Still counts toward revenue/profit on dashboard.
+    No shipping_address (private sales are typically collected in person)."""
+    product = query_db("SELECT id, status FROM products WHERE id = ?",
+                       (product_id,), one=True)
+    if not product:
+        flash('Product not found.', 'error')
+        return redirect(url_for('pallets_list'))
+
+    try:
+        price = float(request.form.get('price_gbp', '0') or '0')
+    except ValueError:
+        price = 0.0
+    if price <= 0:
+        flash('Enter a sale price greater than 0.', 'error')
+        return redirect(url_for('product_detail', product_id=product_id))
+
+    buyer = (request.form.get('buyer') or '').strip() or 'Private buyer'
+    notes = (request.form.get('notes') or '').strip()
+    mark_shipped = request.form.get('mark_shipped') == '1'
+
+    # Private sales are typically completed on the spot — default to 'shipped'
+    # if the uncle ticked the "already handed over" box, otherwise 'new'.
+    status = 'shipped' if mark_shipped else 'new'
+    shipped_at = 'CURRENT_TIMESTAMP' if mark_shipped else 'NULL'
+
+    execute_db(
+        f"INSERT INTO sales (product_id, price_gbp, buyer, status, source, notes, shipped_at) "
+        f"VALUES (?, ?, ?, ?, 'private', ?, {shipped_at})",
+        (product_id, price, buyer, status, notes)
+    )
+
+    # Mark product sold/shipped so it stops appearing as "warehouse stock".
+    product_new_status = 'shipped' if mark_shipped else 'sold'
+    execute_db("UPDATE products SET status=? WHERE id=?",
+               (product_new_status, product_id))
+
+    flash(f'Private sale recorded: £{price:.2f}.', 'success')
+    return redirect(url_for('product_detail', product_id=product_id))
 
 
 # ===================================================================
@@ -2413,7 +2699,12 @@ def csv_import(pallet_id):
             from modules.scraper import scrape_amazon_product, get_amazon_image_url
 
             for row in rows:
-                name = get_col(row, 'name', 'title', 'product', 'nazwa', 'description')
+                name = get_col(row, 'name', 'title', 'product', 'nazwa')
+                # Supplier ground-truth description (actual pallet contents) — kept
+                # separate from name so AI can weight it above Amazon variant metadata.
+                supplier_desc = get_col(row, 'product description', 'description', 'opis')
+                if not name:
+                    name = supplier_desc
                 if not name:
                     continue
 
@@ -2450,8 +2741,10 @@ def csv_import(pallet_id):
 
                 execute_db(
                     "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
-                    "condition, ebay_price_gbp, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (pallet_id, name, asin, ean, qty, cond, price, image_url)
+                    "condition, ebay_price_gbp, image_url, supplier_description) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (pallet_id, name, asin, ean, qty, cond, price, image_url,
+                     supplier_desc)
                 )
                 count += 1
 
@@ -2498,10 +2791,32 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
     </h1>
 </div>
 
+{% if colour_mismatch %}
+<!-- Colour-mismatch warning: Amazon variant metadata doesn't line up with what the
+     supplier says is physically in the pallet. Classic case: Amazon ASIN is the
+     "Champagne / Warm white" variant, supplier shipped the "Green" variant. -->
+<div class="card" style="border:1px solid rgba(245,158,11,0.4);background:rgba(245,158,11,0.08);margin-bottom:16px">
+    <div style="display:flex;gap:12px;align-items:flex-start">
+        <span class="material-symbols-outlined" style="color:#f59e0b;font-size:28px;flex-shrink:0">warning</span>
+        <div style="flex:1">
+            <div style="font-weight:700;color:#f59e0b;margin-bottom:4px">Colour mismatch — check before listing</div>
+            <div style="font-size:0.85rem;color:var(--text);line-height:1.5">
+                Supplier says: <strong>{{ colour_mismatch.supplier|join(', ') }}</strong>.
+                Amazon says: <strong>{{ colour_mismatch.amazon|join(', ') }}</strong>.<br>
+                The ASIN on Amazon is probably a different variant than what's in the pallet.
+                Upload your own photos below and the AI will lean on the supplier description
+                instead of Amazon's variant metadata.
+            </div>
+        </div>
+    </div>
+</div>
+{% endif %}
+
 <div class="detail-header">
     <div style="flex-shrink:0;">
-        {% set all_images = product.images|default('', true) %}
-        {% if all_images and all_images != '[]' and all_images != '' %}
+        {% set amazon_images_raw = product.images|default('', true) %}
+        {% set has_any_image = (amazon_images_raw and amazon_images_raw not in ('[]', '')) or custom_images or product.image_url %}
+        {% if has_any_image %}
         <!-- 3D Image Carousel -->
         <style>
         .carousel-3d{position:relative;height:520px;display:flex;align-items:center;justify-content:center;perspective:1200px;overflow:visible;margin:0 auto;max-width:900px}
@@ -2527,9 +2842,16 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         <div class="c3d-dots" id="c3dDots"></div>
         <script>
         (function(){
-            var imgs = [];
-            try { imgs = JSON.parse({{ all_images|tojson }}); } catch(e){}
-            if (!imgs || imgs.length === 0) imgs = ['{{ product.image_url or "" }}'];
+            // Custom (user-uploaded) photos take priority — they're the actual
+            // pallet contents, not Amazon's variant stock shots.
+            var customImgs = {{ custom_images|tojson }};
+            var customUrls = (customImgs || []).map(function(p){ return '/static/' + p; });
+            var amazonImgs = [];
+            try { amazonImgs = JSON.parse({{ amazon_images_raw|tojson }}); } catch(e){}
+            if (!amazonImgs || !amazonImgs.length) {
+                amazonImgs = ['{{ product.image_url or "" }}'];
+            }
+            var imgs = customUrls.concat(amazonImgs);
             imgs = imgs.filter(function(u){ return u && u.length > 5; });
             if (imgs.length === 0) return;
 
@@ -2620,6 +2942,59 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         </dl>
     </div>
 </div>
+
+<!-- Your Own Photos — override Amazon variant shots with actual pallet contents.
+     Custom uploads appear FIRST in the carousel and when publishing to eBay. -->
+<div class="section-title">Your Photos</div>
+<div class="card">
+    <div style="font-size:0.85rem;color:var(--text-muted);margin-bottom:12px">
+        Upload pictures of what's physically in the pallet. These appear before Amazon photos
+        in the listing — useful when the Amazon ASIN shows a different colour/variant.
+        Max 8 MB per file. JPG/PNG/WebP/GIF.
+    </div>
+    <form method="POST" action="/product/{{ product.id }}/upload-images" enctype="multipart/form-data">
+        <div class="form-group">
+            <input type="file" name="images" accept="image/jpeg,image/png,image/webp,image/gif"
+                   multiple class="form-control"
+                   style="padding:10px;cursor:pointer">
+        </div>
+        <button type="submit" class="btn btn-purple btn-sm">
+            <span class="material-symbols-outlined">upload</span> Upload Photos
+        </button>
+    </form>
+    {% if custom_images %}
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-top:16px">
+        {% for rel in custom_images %}
+        <div style="position:relative;border-radius:8px;overflow:hidden;background:rgba(255,255,255,0.95);aspect-ratio:1;display:flex;align-items:center;justify-content:center">
+            <img src="/static/{{ rel }}" style="max-width:100%;max-height:100%;object-fit:contain;cursor:zoom-in"
+                 onclick="window.open('/static/{{ rel }}','_blank')">
+            <form method="POST" action="/product/{{ product.id }}/delete-image"
+                  style="position:absolute;top:4px;right:4px;margin:0"
+                  onsubmit="return confirm('Delete this photo?')">
+                <input type="hidden" name="path" value="{{ rel }}">
+                <button type="submit"
+                        style="width:28px;height:28px;border-radius:50%;border:none;background:rgba(255,68,68,0.9);color:white;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0"
+                        title="Delete photo">
+                    <span class="material-symbols-outlined" style="font-size:18px">close</span>
+                </button>
+            </form>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+</div>
+
+<!-- Supplier Description — the ground truth from the joblot spec. Shown so the
+     uncle can see what the AI will anchor the listing on, vs the Amazon blurb. -->
+{% if product.supplier_description %}
+<div class="section-title">Supplier Description</div>
+<div class="card">
+    <div style="font-size:0.8rem;color:var(--text-muted);margin-bottom:6px">
+        From the supplier's CSV/ODS. Used as the AI's source of truth for what's in the pallet.
+    </div>
+    <div style="font-size:0.9rem;line-height:1.5;white-space:pre-wrap">{{ product.supplier_description }}</div>
+</div>
+{% endif %}
 
 <!-- Item Specifics -->
 {% set specs_raw = product.item_specifics|default('', true) %}
@@ -2887,6 +3262,55 @@ function generateAI(type) {
 </div>
 {% endif %}
 
+<!-- Sell Privately — when the uncle sells in person, to a friend, at a local
+     market, or anywhere outside eBay. Still counts toward revenue/profit.
+     Shown whenever no sale has been recorded yet — even if the product was
+     manually set to 'sold' (so uncle can backfill a private sale after the fact). -->
+{% if not sales %}
+<div class="section-title">Sprzedaż prywatna</div>
+<div class="card">
+    <div style="font-size:0.85rem;color:var(--text-muted);margin-bottom:12px">
+        Use this when the item is sold outside eBay (in person, cash, to a friend).
+        It will be added to revenue on the dashboard and marked as sold.
+        {% if product.status in ('sold', 'shipped') %}
+        <br><span style="color:var(--warning)">Status is already "{{ product.status }}" but no sale record exists —
+        fill this in to backfill the revenue.</span>
+        {% endif %}
+    </div>
+    <form method="POST" action="/product/{{ product.id }}/sell-private"
+          onsubmit="return confirm('Record private sale for £' + this.price_gbp.value + '?')">
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">Sale price (GBP) *</label>
+                <input type="number" name="price_gbp" step="0.01" min="0.01"
+                       class="form-control" required
+                       value="{{ '%.2f'|format(product.ebay_price_gbp or 0) }}">
+            </div>
+            <div class="form-group">
+                <label class="form-label">Buyer (optional)</label>
+                <input type="text" name="buyer" class="form-control"
+                       placeholder="e.g. John (friend) / local market">
+            </div>
+        </div>
+        <div class="form-group">
+            <label class="form-label">Notes (optional)</label>
+            <input type="text" name="notes" class="form-control"
+                   placeholder="e.g. paid cash, collected in person">
+        </div>
+        <div style="display:flex;gap:12px;align-items:center;margin-top:8px">
+            <label style="display:flex;gap:6px;align-items:center;cursor:pointer;font-size:0.9rem">
+                <input type="checkbox" name="mark_shipped" value="1" checked>
+                Already handed over (mark as shipped)
+            </label>
+            <button type="submit" class="btn btn-lime">
+                <span class="material-symbols-outlined">payments</span>
+                Record private sale
+            </button>
+        </div>
+    </form>
+</div>
+{% endif %}
+
 <!-- Sales History -->
 {% if sales %}
 <div class="section-title">Sales History</div>
@@ -2896,9 +3320,11 @@ function generateAI(type) {
             <tr>
                 <th>Buyer</th>
                 <th>Price</th>
+                <th>Source</th>
                 <th>Status</th>
                 <th>Sold</th>
                 <th>Shipped</th>
+                <th>Notes</th>
             </tr>
         </thead>
         <tbody>
@@ -2906,9 +3332,19 @@ function generateAI(type) {
             <tr>
                 <td>{{ s.buyer or 'Unknown' }}</td>
                 <td class="text-lime">{{ fmt_gbp(s.price_gbp) }}</td>
+                <td>
+                    {% if (s.source or 'ebay') == 'private' %}
+                    <span class="badge" style="background:rgba(190,238,0,0.15);color:var(--lime);border:1px solid rgba(190,238,0,0.3)">PRIVATE</span>
+                    {% else %}
+                    <span class="badge" style="background:rgba(143,245,255,0.12);color:var(--cyan);border:1px solid rgba(143,245,255,0.25)">eBay</span>
+                    {% endif %}
+                </td>
                 <td><span class="badge {{ status_color(s.status) }}">{{ s.status }}</span></td>
                 <td class="text-muted">{{ fmt_datetime(s.sold_at) }}</td>
                 <td class="text-muted">{{ fmt_datetime(s.shipped_at) }}</td>
+                <td class="text-muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">
+                    {{ s.notes or '-' }}
+                </td>
             </tr>
             {% endfor %}
         </tbody>
@@ -2957,12 +3393,15 @@ def product_detail(product_id):
         (product_id,)
     )
 
+    custom_images = _load_custom_images(product)
+    mismatch = detect_colour_mismatch(product)
     return render_page(
         TEMPLATE_PRODUCT_DETAIL_CONTENT,
         page_title=f'{product["name"]} - eBay Hub UK',
         active_page='pallets',
         product=product, pallet=pallet, listings=listings, sales=sales, draft=draft,
         shipping_groups=get_shipping_options_grouped(),
+        custom_images=custom_images, colour_mismatch=mismatch,
     )
 
 
@@ -3115,6 +3554,7 @@ TEMPLATE_ORDERS_CONTENT = """
                 <th>Product</th>
                 <th>Buyer</th>
                 <th>Price</th>
+                <th>Source</th>
                 <th>Status</th>
                 <th>Sold</th>
                 <th>Address</th>
@@ -3141,10 +3581,17 @@ TEMPLATE_ORDERS_CONTENT = """
                 </td>
                 <td>{{ o.buyer or '-' }}</td>
                 <td class="text-lime">{{ fmt_gbp(o.price_gbp) }}</td>
+                <td>
+                    {% if (o.source or 'ebay') == 'private' %}
+                    <span class="badge" style="background:rgba(190,238,0,0.15);color:var(--lime);border:1px solid rgba(190,238,0,0.3)">PRIVATE</span>
+                    {% else %}
+                    <span class="badge" style="background:rgba(143,245,255,0.12);color:var(--cyan);border:1px solid rgba(143,245,255,0.25)">eBay</span>
+                    {% endif %}
+                </td>
                 <td><span class="badge {{ status_color(o.status) }}">{{ o.status }}</span></td>
                 <td class="text-muted">{{ fmt_datetime(o.sold_at) }}</td>
                 <td class="text-muted" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;">
-                    {{ o.shipping_address[:60] if o.shipping_address else '-' }}
+                    {{ o.shipping_address[:60] if o.shipping_address else (o.notes[:60] if o.notes else '-') }}
                 </td>
                 <td>
                     {% if o.status == 'new' %}
@@ -3759,8 +4206,13 @@ def auto_process_products(pallet_id):
         ebay_category = product.get('category', '')
 
         if gemini_key:
-            # Build context for AI from bullet points and specs
+            # Build context for AI. Order matters — the supplier description is
+            # the ground truth (physically in the pallet) and must outrank Amazon
+            # metadata when they disagree on colour/variant.
+            supplier_desc = (product.get('supplier_description') or '').strip()
             context_parts = []
+            if supplier_desc:
+                context_parts.append("Supplier description (ground truth): " + supplier_desc)
             if bullet_points:
                 context_parts.append("Features: " + "; ".join(bullet_points[:5]))
             if item_specifics:
@@ -3769,19 +4221,24 @@ def auto_process_products(pallet_id):
             context = "\n".join(context_parts) if context_parts else ""
 
             # --- Step 2: Generate eBay-optimized title ---
-            # Feed Gemini our scraped Specs as source of truth, and warn that
-            # the Amazon product name may mix variant keywords.
+            # Hierarchy of truth, strongest to weakest:
+            #   1. Supplier description (physical contents of the pallet)
+            #   2. Amazon Specs (brand, model, dimensions — usually right)
+            #   3. Amazon Product title (often variant-stuffed — last resort only)
             title_prompt = (
                 f'Generate a concise eBay UK listing title (max 80 characters) for this product. '
-                f'Include brand, model, product type, size, and key functional specs. '
-                f'\n\n'
-                f'Data source rules:\n'
-                f'- The "Specs:" block below is from our scraper — SOURCE OF TRUTH. '
-                f'Use it for brand, model, size, material, etc.\n'
-                f'- The "Product:" name is from Amazon and often bundles several variants '
-                f'under one keyword-stuffed title (colour, theme, pattern, seasonal motif). '
-                f'Do NOT echo colour/theme/pattern words from the product name unless '
-                f'they also appear in Specs.\n\n'
+                f'Include brand, model, product type, size, and key functional specs.\n\n'
+                f'Data source rules (apply in this order of trust):\n'
+                f'1. "Supplier description" is the GROUND TRUTH — it describes what is '
+                f'physically in the pallet. If it names a colour/variant/theme, use THAT.\n'
+                f'2. "Specs" is from our Amazon scraper — use it for brand, model, size, '
+                f'material. If Specs disagree with Supplier description on '
+                f'colour/variant/theme, TRUST THE SUPPLIER. Amazon often lists a different '
+                f'variant than what the supplier actually shipped.\n'
+                f'3. "Product" name is the Amazon title and often bundles multiple variants '
+                f'(colour, theme, pattern, seasonal motif) into one keyword-stuffed string. '
+                f'Do NOT copy colour/theme/pattern words from it unless they also appear '
+                f'in the Supplier description or Specs.\n\n'
                 f'No quotes, no special characters. English only.\n\n'
                 f'Product: {product_name}\n'
                 f'{context}\n\n'
@@ -3793,25 +4250,23 @@ def auto_process_products(pallet_id):
             time.sleep(1)
 
             # --- Step 3: Generate HTML description ---
-            # Rules for the model:
-            #   - Use our Specs block as the source of truth (scraper output).
-            #   - Don't mention condition (eBay shows it as a dedicated field).
-            #   - Don't echo colour/theme/pattern words from the Amazon name
-            #     unless they appear in Specs (Amazon often bundles variants).
+            # Same hierarchy as the title prompt.
             desc_prompt = (
                 f'Generate a professional eBay UK product description in HTML. '
                 f'Include: product highlights as bullet points, a key specifications table, '
-                f'and a professional closing. '
-                f'\n\n'
-                f'Data source rules:\n'
-                f'- The "Specs:" block below is from our scraper — SOURCE OF TRUTH. '
-                f'Build the specifications table from it. Every row must come from Specs.\n'
-                f'- The "Product:" name is from Amazon and often bundles several variants '
-                f'under one keyword-stuffed title (colour, theme, pattern, seasonal motif). '
-                f'Do NOT echo colour/theme/pattern words from the product name in the '
-                f'description unless they also appear in Specs. Let the photos show the '
-                f'exact variant.\n'
-                f'- Features may come from the "Features:" block if present.\n\n'
+                f'and a professional closing.\n\n'
+                f'Data source rules (apply in this order of trust):\n'
+                f'1. "Supplier description" is the GROUND TRUTH — it describes what is '
+                f'physically in the pallet. Use its wording for colour/variant/theme '
+                f'everywhere they appear in the description.\n'
+                f'2. "Specs" is from our Amazon scraper — build the specifications table '
+                f'from it. If Specs disagree with Supplier description on colour or '
+                f'variant, TRUST THE SUPPLIER and omit or override the conflicting Spec '
+                f'rows (Amazon often lists a different variant than what actually shipped).\n'
+                f'3. "Product" name is the Amazon title and often bundles multiple variants '
+                f'into one keyword-stuffed string. Do NOT copy colour/theme/pattern words '
+                f'from it unless they also appear in the Supplier description.\n'
+                f'4. Features may come from the "Features:" block if present.\n\n'
                 f'Do NOT mention the product condition anywhere — eBay displays it separately. '
                 f'Use clean HTML (div, ul, li, p, strong, table tags). '
                 f'Do NOT include <html>, <head>, or <body> tags. '
@@ -3982,19 +4437,26 @@ def api_generate_title():
     product_name = data.get('product_name', '')
     product_id = data.get('product_id')
 
-    # Pull our scraped specs from DB — gives Gemini a SOURCE OF TRUTH so it
-    # doesn't just echo variant keywords from the Amazon product name.
+    # Pull supplier description (ground truth about pallet contents) and
+    # scraped specs from DB. Supplier description wins on colour/variant
+    # disputes — see auto_process_products for the full rationale.
     specs_text = ''
+    supplier_block = ''
     if product_id:
-        row = query_db("SELECT item_specifics FROM products WHERE id = ?",
-                       (product_id,), one=True)
-        if row and row.get('item_specifics'):
-            try:
-                sp = json.loads(row['item_specifics'])
-                if isinstance(sp, dict) and sp:
-                    specs_text = 'Specs: ' + ', '.join(f'{k}: {v}' for k, v in list(sp.items())[:10])
-            except (json.JSONDecodeError, TypeError):
-                pass
+        row = query_db(
+            "SELECT item_specifics, supplier_description FROM products WHERE id = ?",
+            (product_id,), one=True)
+        if row:
+            supplier_desc = (row.get('supplier_description') or '').strip()
+            if supplier_desc:
+                supplier_block = 'Supplier description (ground truth): ' + supplier_desc + '\n'
+            if row.get('item_specifics'):
+                try:
+                    sp = json.loads(row['item_specifics'])
+                    if isinstance(sp, dict) and sp:
+                        specs_text = 'Specs: ' + ', '.join(f'{k}: {v}' for k, v in list(sp.items())[:10])
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
     if not product_name:
         return jsonify({'ok': False, 'error': 'No product name'})
@@ -4010,16 +4472,19 @@ def api_generate_title():
             json={
                 'contents': [{'parts': [{'text':
                     f'Generate a concise eBay UK listing title (max 80 characters) for this product. '
-                    f'Include brand, model, product type, size, and key functional specs. '
-                    f'\n\n'
-                    f'Data source rules:\n'
-                    f'- The "Specs:" block is from our scraper — SOURCE OF TRUTH.\n'
-                    f'- The "Product:" name is from Amazon and may bundle variant keywords '
-                    f'(colour/theme/pattern) that do not match the physical item. Do NOT copy '
-                    f'colour/theme/pattern words from the name unless they also appear in Specs.\n\n'
+                    f'Include brand, model, product type, size, and key functional specs.\n\n'
+                    f'Data source rules (apply in this order of trust):\n'
+                    f'1. "Supplier description" is GROUND TRUTH — it describes what is '
+                    f'physically in the pallet. Use its colour/variant/theme wording.\n'
+                    f'2. "Specs" is from our Amazon scraper. Use for brand/model/size. If Specs '
+                    f'disagree with Supplier description on colour or variant, TRUST THE '
+                    f'SUPPLIER — Amazon often lists a different variant than what shipped.\n'
+                    f'3. "Product" name is the Amazon title and may bundle variant keywords '
+                    f'(colour/theme/pattern). Do NOT copy those words unless they appear in '
+                    f'the Supplier description or Specs.\n\n'
                     f'No quotes, no special characters. English only.\n\n'
                     f'Product: {product_name}\n'
-                    f'{specs_text}\n\n'
+                    f'{supplier_block}{specs_text}\n\n'
                     f'Return ONLY the title, nothing else.'
                 }]}]
             },
@@ -4044,19 +4509,25 @@ def api_generate_description():
     product_name = data.get('product_name', '')
     product_id = data.get('product_id')
 
-    # Pull our scraped specs from DB so Gemini builds the spec table from
-    # structured data rather than inventing from the Amazon product name.
+    # Pull supplier description + scraped specs. Supplier wins on
+    # colour/variant — see auto_process_products for the rationale.
     specs_text = ''
+    supplier_block = ''
     if product_id:
-        row = query_db("SELECT item_specifics FROM products WHERE id = ?",
-                       (product_id,), one=True)
-        if row and row.get('item_specifics'):
-            try:
-                sp = json.loads(row['item_specifics'])
-                if isinstance(sp, dict) and sp:
-                    specs_text = 'Specs: ' + ', '.join(f'{k}: {v}' for k, v in list(sp.items())[:10])
-            except (json.JSONDecodeError, TypeError):
-                pass
+        row = query_db(
+            "SELECT item_specifics, supplier_description FROM products WHERE id = ?",
+            (product_id,), one=True)
+        if row:
+            supplier_desc = (row.get('supplier_description') or '').strip()
+            if supplier_desc:
+                supplier_block = 'Supplier description (ground truth): ' + supplier_desc + '\n'
+            if row.get('item_specifics'):
+                try:
+                    sp = json.loads(row['item_specifics'])
+                    if isinstance(sp, dict) and sp:
+                        specs_text = 'Specs: ' + ', '.join(f'{k}: {v}' for k, v in list(sp.items())[:10])
+                except (json.JSONDecodeError, TypeError):
+                    pass
 
     if not product_name:
         return jsonify({'ok': False, 'error': 'No product name'})
@@ -4073,20 +4544,22 @@ def api_generate_description():
                 'contents': [{'parts': [{'text':
                     f'Generate a professional eBay UK product description in HTML for this product. '
                     f'Include: key features as bullet points, a specifications table (built from '
-                    f'Specs), and a professional closing. '
-                    f'\n\n'
-                    f'Data source rules:\n'
-                    f'- The "Specs:" block is from our scraper — SOURCE OF TRUTH. '
-                    f'Build the specifications table from it.\n'
-                    f'- The "Product:" name is from Amazon and may bundle variant keywords '
-                    f'(colour/theme/pattern) that do not match the physical item. Do NOT copy '
-                    f'colour/theme/pattern words from the name unless they also appear in Specs. '
-                    f'Let the photos show the exact variant.\n\n'
+                    f'Specs), and a professional closing.\n\n'
+                    f'Data source rules (apply in this order of trust):\n'
+                    f'1. "Supplier description" is GROUND TRUTH — it describes what is physically '
+                    f'in the pallet. Use its colour/variant/theme wording throughout.\n'
+                    f'2. "Specs" is from our Amazon scraper — build the specifications table '
+                    f'from it. If Specs disagree with Supplier description on colour or variant, '
+                    f'TRUST THE SUPPLIER and omit or override conflicting Spec rows. Amazon '
+                    f'often lists a different variant than what actually shipped.\n'
+                    f'3. "Product" name is the Amazon title and may bundle variant keywords '
+                    f'(colour/theme/pattern). Do NOT copy those words unless they appear in the '
+                    f'Supplier description.\n\n'
                     f'Do NOT mention the product condition anywhere — eBay displays it separately. '
                     f'Use clean HTML (div, ul, li, p, strong, table tags). Keep it concise but '
                     f'informative. English only. Do NOT include the title.\n\n'
                     f'Product: {product_name}\n'
-                    f'{specs_text}\n\n'
+                    f'{supplier_block}{specs_text}\n\n'
                     f'Return ONLY the HTML description, no markdown, no code blocks.'
                 }]}]
             },
