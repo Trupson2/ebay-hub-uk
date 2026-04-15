@@ -787,26 +787,44 @@ def _run_pallet_scrape(pallet_id, override):
             except Exception:
                 amz_data = None
 
-            if amz_data and amz_data.get('image_url'):
+            if amz_data:
                 new_name = amz_data.get('title') or prod['name']
+                new_image = amz_data.get('image_url')  # may be None now —
+                # the scraper returns None when the page had no parseable
+                # image rather than a broken constructed-from-ASIN URL.
 
                 if has_image:
-                    # Title-only upgrade — don't touch images/price/specs.
+                    # Product already has a good image; just update the
+                    # title if we got a better one (e.g. English upgrade).
+                    # Leave image/price/specs alone — user may have
+                    # customised them.
                     if new_name and new_name != prod['name']:
                         execute_db(
                             "UPDATE products SET name = ? WHERE id = ?",
                             (new_name, prod['id'])
                         )
                         updated += 1
-                else:
-                    # Full scrape (had no image before).
-                    new_image = amz_data['image_url']
+                elif new_image:
+                    # Full scrape — no prior image, now we have one.
                     new_price = amz_data.get('price') or prod['ebay_price_gbp']
                     images_json = json.dumps(amz_data.get('all_images', []))
                     specs_json = json.dumps(amz_data.get('item_specifics', {}))
                     execute_db(
                         "UPDATE products SET name = ?, image_url = ?, ebay_price_gbp = ?, images = ?, item_specifics = ? WHERE id = ?",
                         (new_name, new_image, new_price, images_json, specs_json, prod['id'])
+                    )
+                    updated += 1
+                else:
+                    # Scrape found the product (title/price/specs) but the
+                    # page genuinely has no parseable image. Update the
+                    # text fields and CLEAR image_url so the broken URL
+                    # doesn't linger in the DB. Uncle can upload a custom
+                    # image for this product via the edit page.
+                    new_price = amz_data.get('price') or prod['ebay_price_gbp']
+                    specs_json = json.dumps(amz_data.get('item_specifics', {}))
+                    execute_db(
+                        "UPDATE products SET name = ?, image_url = '', ebay_price_gbp = ?, images = '[]', item_specifics = ? WHERE id = ?",
+                        (new_name, new_price, specs_json, prod['id'])
                     )
                     updated += 1
 
@@ -816,9 +834,12 @@ def _run_pallet_scrape(pallet_id, override):
                     if not effective_override and detected_domain:
                         effective_override = detected_domain
             elif not has_image:
-                # Fallback: try static media.amazon.com image URLs (domain-agnostic).
-                # Skip entirely for title-only upgrades — the product already
-                # has a valid image, don't replace it with a HEAD-checked guess.
+                # Scrape totally failed (CAPTCHA on every locale or ASIN
+                # not listed anywhere). Last resort: HEAD-check a few
+                # static media.amazon.com URL patterns. This only ever
+                # works for book covers (/images/P/{asin}.*) — the /I/
+                # patterns almost always 404, but the HEAD check filters
+                # them out anyway.
                 for url in get_amazon_image_urls(prod['asin']):
                     try:
                         r = _req.head(url, timeout=5, allow_redirects=True)

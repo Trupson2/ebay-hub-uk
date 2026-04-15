@@ -296,10 +296,15 @@ def _extract_all_images(soup, page_text='', asin=''):
             if clean_url not in images:
                 images.append(clean_url)
 
-    # Fallback
-    if not images and asin:
-        images = [f'https://m.media-amazon.com/images/I/{asin}._AC_SL1500_.jpg']
-
+    # NO asin-based fallback here. The old code used to return
+    # [f"https://m.media-amazon.com/images/I/{asin}._AC_SL1500_.jpg"]
+    # when nothing else was found, but Amazon's image-ID namespace is
+    # completely separate from the ASIN namespace — the URL looks
+    # plausible but almost always 404s. Worse, it was being written
+    # straight into the DB and then passing every "has image" check,
+    # causing the same product to be re-scraped forever with no
+    # improvement. Now: return [] here and let the caller decide how
+    # to handle the "no image available" case (manual upload).
     return images[:8]
 
 
@@ -441,25 +446,38 @@ def _scrape_single_domain(asin, domain, session=None):
         # first gallery image (which is often extracted from embedded JSON
         # even on "Currently unavailable" pages).
         image_url = _extract_image(soup)
-        if not image_url and all_images:
-            # _extract_all_images has a last-resort fallback that constructs
-            # a URL from the ASIN itself (/I/{asin}._AC_SL1500_.jpg). That
-            # URL is almost always 404 because Amazon image IDs and ASINs
-            # are separate namespaces. Prefer any gallery entry that didn't
-            # come from that constructed pattern.
-            constructed_basename = f"{asin}."
-            for candidate in all_images:
-                basename = candidate.rsplit('/', 1)[-1]
-                if not basename.startswith(constructed_basename):
-                    image_url = candidate
-                    break
-            if not image_url:
-                image_url = all_images[0]
 
-        # Ensure main image is first in all_images
+        # Defensively reject anything that is actually the broken
+        # constructed-from-ASIN URL. _extract_all_images no longer emits
+        # that fallback, but raw page_text regex matches could still
+        # surface one and we don't want to write it into the DB again.
+        def _is_broken_asin_url(u):
+            if not u:
+                return False
+            basename = u.rsplit('/', 1)[-1]
+            return basename.startswith(f"{asin}.")
+
+        if _is_broken_asin_url(image_url):
+            image_url = None
+
+        all_images = [u for u in all_images if not _is_broken_asin_url(u)]
+
+        # If DOM scrape failed but the gallery has real images, promote
+        # the first gallery image. Only non-broken URLs remain at this
+        # point, so no further filtering needed.
+        if not image_url and all_images:
+            image_url = all_images[0]
+
+        # Ensure main image is first in all_images (no duplicate)
         if image_url and image_url not in all_images:
             all_images.insert(0, image_url)
         all_images = all_images[:8]
+
+        if not image_url:
+            logger.info(
+                f"[SCRAPE] {asin} on {domain}: page parsed but no usable image "
+                f"(title='{(title or '')[:40]}...') — manual upload needed"
+            )
 
         logger.info(
             f"[SCRAPE] {asin} from {domain}: {title[:50]}... "
