@@ -713,31 +713,37 @@ def _run_pallet_scrape(pallet_id, override):
             (pallet_id,)
         )
 
-        def _needs_work(p):
-            """A product needs re-scraping if any of:
-              - it has no image at all, or
-              - its image_url is the broken ASIN-based fallback that the old
-                code wrote before the scraper was fixed (pattern:
-                /I/{ASIN}._AC_SL1500_.jpg — almost always a 404), or
-              - its title still has non-ASCII chars (Polish/German/etc)."""
+        def _has_real_image(p):
+            """Does this product have a genuine scraped image (not the broken
+            ASIN-based fallback)?
+
+            The old scraper wrote `/I/{ASIN}._AC_SL1500_.jpg` as an image URL
+            when the real page couldn't be parsed. That URL is almost always a
+            404 because Amazon image IDs and ASINs are separate namespaces —
+            real image paths look like `/I/51b9uFtR45L.jpg`.
+
+            Used both to decide whether to re-scrape (_needs_work) AND to
+            decide whether the in-loop scrape should do a full update or a
+            title-only upgrade. The two MUST agree, otherwise we re-queue a
+            product and then leave its image untouched in the loop (the
+            exact bug the uncle was seeing on one product)."""
             asin = (p.get('asin') or '').strip()
             img_url = (p.get('image_url') or '').strip()
             images = (p.get('images') or '').strip()
-
-            # Detect the broken constructed-from-ASIN URL. Real Amazon image
-            # paths contain IDs like "51b9uFtR45L" — they don't start with
-            # "B0..." (the ASIN namespace).
             constructed_pattern = f"/I/{asin}." if asin else None
             looks_broken = bool(constructed_pattern and constructed_pattern in img_url)
-
-            has_real_image = (
+            return bool(
                 (img_url and not looks_broken)
                 or (images and images != '[]')
             )
+
+        def _needs_work(p):
+            """A product needs re-scraping if it has no real image OR its
+            title still has non-ASCII chars (Polish/German/etc)."""
             non_english_title = any(
                 c.isalpha() and ord(c) > 127 for c in (p.get('name') or '')
             )
-            return (not has_real_image) or non_english_title
+            return (not _has_real_image(p)) or non_english_title
 
         products = [p for p in all_products if _needs_work(p)]
         total_pending = len(products)
@@ -770,10 +776,12 @@ def _run_pallet_scrape(pallet_id, override):
             # title upgrade should NOT have its images/price/specs rewritten
             # — those were scraped successfully before and the user might
             # have customised them.
-            has_image = (
-                (prod.get('image_url') or '').strip()
-                or (prod.get('images') or '').strip() not in ('', '[]')
-            )
+            # IMPORTANT: use the SAME _has_real_image check as _needs_work.
+            # If we diverge here (e.g. accept the broken constructed URL as
+            # an image) we go into the title-only branch and never replace
+            # the bad URL — which is exactly the bug that had one product
+            # stuck with no image even after repeated scrapes.
+            has_image = _has_real_image(prod)
             try:
                 amz_data = scrape_amazon_product(prod['asin'], effective_override)
             except Exception:
