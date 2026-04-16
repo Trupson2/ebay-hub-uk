@@ -836,17 +836,34 @@ def _run_pallet_scrape(pallet_id, override):
             elif not has_image:
                 # Scrape totally failed (CAPTCHA on every locale or ASIN
                 # not listed anywhere). Last resort: HEAD-check a few
-                # static media.amazon.com URL patterns. This only ever
-                # works for book covers (/images/P/{asin}.*) — the /I/
-                # patterns almost always 404, but the HEAD check filters
-                # them out anyway.
+                # static media.amazon.com URL patterns.
+                #
+                # Critical: Amazon returns 200 with a 43-byte transparent
+                # GIF placeholder for products without images (seen on
+                # B08XN8XN85, a "Currently unavailable" listing). Just
+                # checking status_code + content-type="image/*" was not
+                # enough — the placeholder IS a real image, just useless.
+                # Filter by size (>= 2KB) AND disallow image/gif as the
+                # main product image (real Amazon product photos are
+                # always jpeg, never gif).
                 for url in get_amazon_image_urls(prod['asin']):
                     try:
                         r = _req.head(url, timeout=5, allow_redirects=True)
-                        if r.status_code == 200 and 'image' in r.headers.get('content-type', ''):
-                            execute_db("UPDATE products SET image_url = ? WHERE id = ?", (url, prod['id']))
-                            updated += 1
-                            break
+                        if r.status_code != 200:
+                            continue
+                        ctype = r.headers.get('content-type', '').lower()
+                        if 'image' not in ctype or 'gif' in ctype:
+                            continue
+                        try:
+                            clen = int(r.headers.get('content-length', '0'))
+                        except ValueError:
+                            clen = 0
+                        if clen < 2048:
+                            # Placeholder / 1x1 pixel. Skip.
+                            continue
+                        execute_db("UPDATE products SET image_url = ? WHERE id = ?", (url, prod['id']))
+                        updated += 1
+                        break
                     except Exception:
                         continue
 
@@ -1702,6 +1719,126 @@ def product_sell_private(product_id):
 
 
 # ===================================================================
+# Product Units — per-unit condition breakdown
+# ===================================================================
+# The uncle asked for the same "rozbij na sztuki" UX he has in Akces Hub:
+# a product with quantity=37 should be splittable into e.g. 29 new + 8 used.
+# When a split exists (rows in product_units), the display switches from
+# "Qty: 37 · New" to "29 new · 8 used" on the pallet grid, and the per-unit
+# rows drive status tracking going forward. With no split defined, the
+# legacy products.condition + products.quantity continue to work untouched.
+# ===================================================================
+
+# Fixed order so display is deterministic and matches the Add Product form.
+_CONDITION_ORDER = ('new', 'like_new', 'used', 'damaged')
+_CONDITION_SET = set(_CONDITION_ORDER)
+
+
+def _units_breakdown_for_product(product_id):
+    """Return {'new': 29, 'used': 8, ...} for one product, or empty dict if
+    the product has no split defined. Only counts units that haven't been
+    sold/shipped yet — those are the ones still visible as stock on the
+    pallet grid."""
+    rows = query_db(
+        "SELECT condition, COUNT(*) AS n FROM product_units "
+        "WHERE product_id = ? AND status IN ('warehouse', 'listed') "
+        "GROUP BY condition",
+        (product_id,)
+    )
+    return {r['condition']: r['n'] for r in rows}
+
+
+def _units_breakdown_for_pallet(pallet_id):
+    """Return {product_id: {'new': 29, 'used': 8, ...}} for every product
+    in the pallet that has any units defined. Single query so the pallet
+    detail page stays fast even with dozens of products."""
+    rows = query_db("""
+        SELECT u.product_id, u.condition, COUNT(*) AS n
+        FROM product_units u JOIN products p ON u.product_id = p.id
+        WHERE p.pallet_id = ? AND u.status IN ('warehouse', 'listed')
+        GROUP BY u.product_id, u.condition
+    """, (pallet_id,))
+    out = {}
+    for r in rows:
+        out.setdefault(r['product_id'], {})[r['condition']] = r['n']
+    return out
+
+
+@app.route('/product/<int:product_id>/units', methods=['GET'])
+def product_units_get(product_id):
+    """Return current unit split + product metadata as JSON for the modal."""
+    product = query_db(
+        "SELECT id, name, quantity, condition FROM products WHERE id = ?",
+        (product_id,), one=True
+    )
+    if not product:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+    breakdown = _units_breakdown_for_product(product_id)
+    return jsonify({
+        'ok': True,
+        'product': dict(product),
+        'breakdown': breakdown,
+        'total_units': sum(breakdown.values()),
+    })
+
+
+@app.route('/product/<int:product_id>/split', methods=['POST'])
+def product_units_split(product_id):
+    """Replace the product's unit rows with a new split.
+    Body: {"split": {"new": 29, "used": 8}}  (missing conditions default 0)
+    Empty split / zero total = clear the split and go back to legacy mode
+    (products.quantity / products.condition)."""
+    product = query_db(
+        "SELECT id, quantity FROM products WHERE id = ?",
+        (product_id,), one=True
+    )
+    if not product:
+        return jsonify({'ok': False, 'error': 'not_found'}), 404
+
+    data = request.get_json(silent=True) or {}
+    raw_split = data.get('split') or {}
+
+    # Validate + normalise. Unknown keys silently dropped, negatives clamped.
+    clean = {}
+    for cond, n in raw_split.items():
+        if cond not in _CONDITION_SET:
+            continue
+        try:
+            n = int(n or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n > 0:
+            clean[cond] = n
+    total = sum(clean.values())
+
+    # Wipe any previous split in either path — split-set or split-clear.
+    execute_db("DELETE FROM product_units WHERE product_id = ?", (product_id,))
+
+    if total == 0:
+        return jsonify({'ok': True, 'cleared': True, 'total': 0, 'split': {}})
+
+    # Keep products.quantity in sync with the sum of the split so the
+    # pallet-detail stats and estimated_revenue calculations don't drift.
+    execute_db(
+        "UPDATE products SET quantity = ? WHERE id = ?",
+        (total, product_id)
+    )
+
+    # One row per physical unit in canonical condition order.
+    numer = 1
+    for cond in _CONDITION_ORDER:
+        for _ in range(clean.get(cond, 0)):
+            execute_db(
+                "INSERT INTO product_units (product_id, unit_number, condition) "
+                "VALUES (?, ?, ?)",
+                (product_id, numer, cond)
+            )
+            numer += 1
+
+    return jsonify({'ok': True, 'total': total, 'split': clean})
+
+
+# ===================================================================
 # CSS THEME
 # ===================================================================
 
@@ -1909,6 +2046,24 @@ tr:hover td { background: var(--bg-card-hover); }
 .badge-purple { background: rgba(168, 85, 247, 0.12); color: var(--purple); }
 .badge-muted { background: rgba(106, 106, 128, 0.12); color: var(--text-muted); }
 .badge-danger { background: rgba(255, 68, 68, 0.12); color: var(--danger); }
+
+/* Unit-condition chips — shown on the pallet grid when a product has been
+   split into per-condition units (e.g. "29 new · 8 used"). Matches the
+   Akces Hub colour palette the uncle already recognises from rozbijanie. */
+.unit-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    border: 1px solid transparent;
+}
+.unit-chip-new        { background: rgba(190, 238, 0, 0.10); color: var(--lime);   border-color: rgba(190, 238, 0, 0.30); }
+.unit-chip-like_new   { background: rgba(143, 245, 255, 0.10); color: var(--cyan); border-color: rgba(143, 245, 255, 0.30); }
+.unit-chip-used       { background: rgba(234, 179, 8, 0.10); color: #eab308;       border-color: rgba(234, 179, 8, 0.30); }
+.unit-chip-damaged    { background: rgba(239, 68, 68, 0.10); color: #ef4444;       border-color: rgba(239, 68, 68, 0.30); }
 
 /* Buttons */
 .btn {
@@ -3066,8 +3221,16 @@ function applyMultiplier() {
                 <div class="product-card-price">{{ fmt_gbp(p.ebay_price_gbp) }}</div>
                 <span class="badge {{ status_color(p.status) }}">{{ p.status }}</span>
             </div>
-            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:4px;">
-                Qty: {{ p.quantity }} &middot; {{ condition_label(p.condition) }}
+            <div style="font-size:0.75rem;margin-top:4px;display:flex;flex-wrap:wrap;gap:4px;align-items:center;">
+                {% set br = unit_breakdown.get(p.id) %}
+                {% if br %}
+                    {# Per-unit split defined — show "29 new · 8 used" style. #}
+                    {% for cond in ['new','like_new','used','damaged'] if br.get(cond) %}
+                        <span class="unit-chip unit-chip-{{ cond }}">{{ br[cond] }} {{ condition_label(cond) }}</span>
+                    {% endfor %}
+                {% else %}
+                    <span style="color:var(--text-muted)">Qty: {{ p.quantity }} &middot; {{ condition_label(p.condition) }}</span>
+                {% endif %}
             </div>
         </div>
     </a>
@@ -3193,13 +3356,19 @@ def pallet_detail(pallet_id):
     estimated_profit = estimated_revenue - ebay_fee - (pallet['purchase_price_gbp'] or 0)
     estimated_roi = (estimated_profit / (pallet['purchase_price_gbp'] or 1)) * 100 if pallet['purchase_price_gbp'] else 0
 
+    # Per-product unit breakdown (29 new / 8 used etc). Keyed by product id.
+    # Empty dict for products that haven't been split — those fall back to
+    # the legacy "Qty: N · Condition" line in the template.
+    unit_breakdown = _units_breakdown_for_pallet(pallet_id)
+
     return render_page(
         TEMPLATE_PALLET_DETAIL_CONTENT,
         page_title=f'{pallet["name"]} - eBay Hub UK',
         active_page='pallets',
         pallet=pallet, products=products, stats=stats, profit=profit,
         estimated_revenue=estimated_revenue, estimated_profit=estimated_profit,
-        estimated_roi=estimated_roi, products_with_price=est['priced'] or 0
+        estimated_roi=estimated_roi, products_with_price=est['priced'] or 0,
+        unit_breakdown=unit_breakdown,
     )
 
 
@@ -3599,8 +3768,30 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         <dl class="detail-meta">
             <dt>ASIN</dt><dd>{{ product.asin or '-' }}</dd>
             <dt>EAN</dt><dd>{{ product.ean or '-' }}</dd>
+            {% if unit_split %}
+            <dt>Condition</dt>
+            <dd style="display:flex;flex-wrap:wrap;gap:4px;align-items:center">
+                {% for cond in ['new','like_new','used','damaged'] if unit_split.get(cond) %}
+                    <span class="unit-chip unit-chip-{{ cond }}">{{ unit_split[cond] }} {{ condition_label(cond) }}</span>
+                {% endfor %}
+            </dd>
+            <dt>Quantity</dt>
+            <dd style="display:flex;align-items:center;gap:8px">
+                <span>{{ unit_split.values()|sum }}</span>
+                <button type="button" class="btn btn-outline btn-sm" onclick="openSplitModal()" style="padding:4px 10px;font-size:0.75rem">
+                    <span class="material-symbols-outlined" style="font-size:14px">call_split</span> Edit split
+                </button>
+            </dd>
+            {% else %}
             <dt>Condition</dt><dd>{{ condition_label(product.condition) }}</dd>
-            <dt>Quantity</dt><dd>{{ product.quantity }}</dd>
+            <dt>Quantity</dt>
+            <dd style="display:flex;align-items:center;gap:8px">
+                <span>{{ product.quantity }}</span>
+                <button type="button" class="btn btn-outline btn-sm" onclick="openSplitModal()" style="padding:4px 10px;font-size:0.75rem">
+                    <span class="material-symbols-outlined" style="font-size:14px">call_split</span> Split by condition
+                </button>
+            </dd>
+            {% endif %}
             <dt>eBay Price</dt><dd class="text-lime">{{ fmt_gbp(product.ebay_price_gbp) }}</dd>
             <dt>Status</dt><dd><span class="badge {{ status_color(product.status) }}">{{ product.status }}</span></dd>
             <dt>Category</dt><dd>{{ product.category or '-' }}</dd>
@@ -3608,6 +3799,84 @@ TEMPLATE_PRODUCT_DETAIL_CONTENT = """
         </dl>
     </div>
 </div>
+
+<!-- Split by condition modal ("rozbij na sztuki" from Akces Hub).
+     Lets the uncle say "of these 37 pieces, 29 are new and 8 used" so the
+     pallet grid shows a real breakdown instead of a single uniform condition. -->
+<div id="splitModal" class="modal-overlay" onclick="if(event.target===this)closeSplitModal()">
+    <div class="modal" style="max-width:480px">
+        <div class="modal-title">Split {{ product.name|truncate(40) }} by condition</div>
+        <div style="font-size:0.82rem;color:var(--text-muted);margin-bottom:14px">
+            Total pieces in this product. The sum of the fields below will update the quantity.
+            Leave all zero and save to clear the split.
+        </div>
+        {% set _initial = unit_split if unit_split else {product.condition: product.quantity} %}
+        <div id="splitRows" style="display:flex;flex-direction:column;gap:10px">
+            {% for cond, label in [('new','New'),('like_new','Like New'),('used','Used'),('damaged','Damaged')] %}
+            <div style="display:flex;align-items:center;gap:12px">
+                <span class="unit-chip unit-chip-{{ cond }}" style="min-width:80px;justify-content:center">{{ label }}</span>
+                <input type="number" id="split_{{ cond }}" min="0" step="1"
+                       value="{{ _initial.get(cond, 0) }}"
+                       oninput="updateSplitSum()"
+                       class="form-control" style="max-width:120px">
+            </div>
+            {% endfor %}
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+            <div style="font-size:0.9rem">
+                Total: <span id="splitTotal" style="font-weight:600;font-family:'Space Grotesk',sans-serif;color:var(--lime)">0</span>
+            </div>
+            <div style="display:flex;gap:8px">
+                <button type="button" class="btn btn-outline" onclick="closeSplitModal()">Cancel</button>
+                <button type="button" class="btn btn-cyan" onclick="saveSplit()">
+                    <span class="material-symbols-outlined">save</span> Save
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const SPLIT_CONDS = ['new', 'like_new', 'used', 'damaged'];
+
+function openSplitModal() {
+    updateSplitSum();
+    document.getElementById('splitModal').classList.add('active');
+}
+function closeSplitModal() {
+    document.getElementById('splitModal').classList.remove('active');
+}
+function updateSplitSum() {
+    let sum = 0;
+    SPLIT_CONDS.forEach(c => {
+        const v = parseInt(document.getElementById('split_' + c).value || 0);
+        if (v > 0) sum += v;
+    });
+    document.getElementById('splitTotal').textContent = sum;
+}
+function saveSplit() {
+    const split = {};
+    SPLIT_CONDS.forEach(c => {
+        const v = parseInt(document.getElementById('split_' + c).value || 0);
+        if (v > 0) split[c] = v;
+    });
+    fetch('/product/{{ product.id }}/split', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({split})
+    })
+    .then(r => r.json())
+    .then(d => {
+        if (d.ok) {
+            // Reload so the detail page reflects the new quantity + breakdown.
+            window.location.reload();
+        } else {
+            alert('Could not save split: ' + (d.error || 'unknown error'));
+        }
+    })
+    .catch(e => alert('Network error: ' + e));
+}
+</script>
 
 <!-- Your Own Photos — override Amazon variant shots with actual pallet contents.
      Custom uploads appear FIRST in the carousel and when publishing to eBay. -->
@@ -4061,6 +4330,10 @@ def product_detail(product_id):
 
     custom_images = _load_custom_images(product)
     mismatch = detect_colour_mismatch(product)
+    # Unit split (empty dict if the uncle hasn't rozbiłowal this product).
+    # The modal on the product page is pre-filled from this so reopening
+    # it shows the current breakdown and he can adjust rather than restart.
+    unit_split = _units_breakdown_for_product(product_id)
     return render_page(
         TEMPLATE_PRODUCT_DETAIL_CONTENT,
         page_title=f'{product["name"]} - eBay Hub UK',
@@ -4068,6 +4341,7 @@ def product_detail(product_id):
         product=product, pallet=pallet, listings=listings, sales=sales, draft=draft,
         shipping_groups=get_shipping_options_grouped(),
         custom_images=custom_images, colour_mismatch=mismatch,
+        unit_split=unit_split,
     )
 
 

@@ -102,6 +102,28 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT DEFAULT ''
         );
+
+        -- product_units: one row per physical unit in the pallet, so a
+        -- product with quantity=37 can have a breakdown like
+        --   29 x condition='new'
+        --    8 x condition='used'
+        -- Mirrors the `sztuki` table pattern from Akces Hub — the uncle is
+        -- used to "rozbijanie na sztuki" there and asked for the same here.
+        -- When rows exist for a product, they override the simple
+        -- products.condition/quantity pair on the display. When absent,
+        -- the legacy products.condition/quantity is used (so old data
+        -- keeps working untouched).
+        CREATE TABLE IF NOT EXISTS product_units (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            unit_number INTEGER NOT NULL,
+            condition TEXT DEFAULT 'new' CHECK(condition IN ('new', 'like_new', 'used', 'damaged')),
+            status TEXT DEFAULT 'warehouse' CHECK(status IN ('warehouse', 'listed', 'sold', 'shipped')),
+            notes TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (product_id) REFERENCES products(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_product_units_product ON product_units(product_id);
     """)
     conn.commit()
 
