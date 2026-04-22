@@ -436,6 +436,12 @@ def pallet_add():
                 if not prod_name:
                     continue
                 asin = get_col(row, 'asin').upper()
+                # Skip if this ASIN already exists in this pallet (prevents duplicates on re-import)
+                if asin and query_db(
+                    "SELECT id FROM products WHERE pallet_id = ? AND asin = ?",
+                    (pallet_id, asin), one=True
+                ):
+                    continue
                 ean = get_col(row, 'ean', 'barcode', 'upc', 'gtin')
                 try:
                     qty = int(float(get_col(row, 'quantity', 'qty', 'ilosc', 'amount') or '1'))
@@ -499,14 +505,18 @@ def pallet_add():
         except Exception as e:
             flash(f'File import error: {e}', 'error')
 
-    # Run auto-pipeline after import (scrape all images, AI titles/descriptions, create drafts)
+    # Run auto-pipeline after import in background (avoids Cloudflare timeout)
     pipeline_msg = ''
     if imported > 0:
-        try:
-            processed, drafts = auto_process_products(pallet_id)
-            pipeline_msg = f' Auto-pipeline: {processed} scraped, {drafts} drafts created.'
-        except Exception as e:
-            pipeline_msg = f' Auto-pipeline error: {e}'
+        with _pipeline_lock:
+            existing = _pipeline_jobs.get(pallet_id)
+            if not existing or existing.get('status') != 'running':
+                _pipeline_jobs[pallet_id] = {
+                    'status': 'running', 'processed': 0, 'drafts': 0,
+                    'error': '', 'started_at': time.time(),
+                }
+                threading.Thread(target=_run_pallet_pipeline, args=(pallet_id,), daemon=True).start()
+                pipeline_msg = ' Auto-pipeline started in background — images and drafts will appear shortly.'
 
     if merged_into_existing:
         msg = f'Pallet "{name}" already existed — merged into existing pallet (no duplicate created).'
@@ -3588,6 +3598,12 @@ def csv_import(pallet_id):
                     continue
 
                 asin = get_col(row, 'asin').upper()
+                # Skip if this ASIN already exists in this pallet (prevents duplicates on re-import)
+                if asin and query_db(
+                    "SELECT id FROM products WHERE pallet_id = ? AND asin = ?",
+                    (pallet_id, asin), one=True
+                ):
+                    continue
                 ean = get_col(row, 'ean', 'barcode', 'upc', 'gtin')
                 try:
                     qty = int(float(get_col(row, 'quantity', 'qty', 'ilosc', 'amount') or '1'))
@@ -3648,13 +3664,17 @@ def csv_import(pallet_id):
                 where = pallet_domain or 'Amazon (auto-detected)'
                 msg += f' (scraped {scraped} from {where})'
 
-            # Run auto-pipeline (all images, AI titles/descriptions, drafts)
+            # Run auto-pipeline in background (avoids Cloudflare timeout)
             if count > 0:
-                try:
-                    processed, drafts = auto_process_products(pallet_id)
-                    msg += f'. Auto-pipeline: {processed} scraped, {drafts} drafts created'
-                except Exception as e:
-                    msg += f'. Auto-pipeline error: {e}'
+                with _pipeline_lock:
+                    existing = _pipeline_jobs.get(pallet_id)
+                    if not existing or existing.get('status') != 'running':
+                        _pipeline_jobs[pallet_id] = {
+                            'status': 'running', 'processed': 0, 'drafts': 0,
+                            'error': '', 'started_at': time.time(),
+                        }
+                        threading.Thread(target=_run_pallet_pipeline, args=(pallet_id,), daemon=True).start()
+                        msg += '. Auto-pipeline started in background'
 
             flash(msg + '.', 'success')
             return redirect(url_for('pallet_detail', pallet_id=pallet_id))
@@ -5437,7 +5457,9 @@ def auto_process_products(pallet_id):
         bullet_points = []
 
         # --- Step 1: Scrape Amazon (auto-detect or pallet override) ---
-        if product['asin']:
+        # Skip if product already has images (e.g. already scraped during CSV import)
+        already_has_images = bool(product.get('images') and product['images'] not in ('[]', ''))
+        if product['asin'] and not already_has_images:
             try:
                 data = scrape_amazon_product(product['asin'], pallet_domain)
                 if data:
