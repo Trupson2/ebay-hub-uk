@@ -529,6 +529,11 @@ def pallet_delete(pallet_id):
     if not pallet:
         flash('Pallet not found.', 'error')
         return redirect(url_for('pallets_list'))
+    # Cascade: delete child records first (FK order matters with foreign_keys=ON)
+    execute_db("DELETE FROM sales WHERE listing_id IN (SELECT id FROM ebay_listings WHERE product_id IN (SELECT id FROM products WHERE pallet_id = ?))", (pallet_id,))
+    execute_db("DELETE FROM sales WHERE product_id IN (SELECT id FROM products WHERE pallet_id = ?)", (pallet_id,))
+    execute_db("DELETE FROM product_units WHERE product_id IN (SELECT id FROM products WHERE pallet_id = ?)", (pallet_id,))
+    execute_db("DELETE FROM ebay_listings WHERE product_id IN (SELECT id FROM products WHERE pallet_id = ?)", (pallet_id,))
     execute_db("DELETE FROM products WHERE pallet_id = ?", (pallet_id,))
     execute_db("DELETE FROM pallets WHERE id = ?", (pallet_id,))
     flash(f'Pallet "{pallet["name"]}" deleted.', 'success')
@@ -551,6 +556,10 @@ def pallets_bulk_delete():
                 pid_int = int(pid)
             except (TypeError, ValueError):
                 continue
+            execute_db("DELETE FROM sales WHERE listing_id IN (SELECT id FROM ebay_listings WHERE product_id IN (SELECT id FROM products WHERE pallet_id = ?))", (pid_int,))
+            execute_db("DELETE FROM sales WHERE product_id IN (SELECT id FROM products WHERE pallet_id = ?)", (pid_int,))
+            execute_db("DELETE FROM product_units WHERE product_id IN (SELECT id FROM products WHERE pallet_id = ?)", (pid_int,))
+            execute_db("DELETE FROM ebay_listings WHERE product_id IN (SELECT id FROM products WHERE pallet_id = ?)", (pid_int,))
             execute_db("DELETE FROM products WHERE pallet_id = ?", (pid_int,))
             execute_db("DELETE FROM pallets WHERE id = ?", (pid_int,))
             deleted += 1
@@ -693,6 +702,9 @@ def pallet_set_domain(pallet_id):
 
 _scrape_jobs = {}  # pallet_id -> {status, total, done, updated, where, error, started_at}
 _scrape_lock = threading.Lock()
+
+_pipeline_jobs = {}  # pallet_id -> {status, processed, drafts, error, started_at}
+_pipeline_lock = threading.Lock()
 
 
 def _run_pallet_scrape(pallet_id, override):
@@ -3059,6 +3071,55 @@ TEMPLATE_PALLET_DETAIL_CONTENT = """
     }
     poll();
     setInterval(poll, 2000);
+})();
+</script>
+
+<!-- Background auto-pipeline progress bar -->
+<div id="pipeline-progress" style="display:none;background:linear-gradient(135deg,rgba(168,85,247,0.12),rgba(236,72,153,0.12));border:1px solid rgba(168,85,247,0.35);border-radius:10px;padding:12px 16px;margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="color:#a855f7;font-weight:600;font-size:0.9rem">
+            <span class="material-symbols-outlined" style="vertical-align:middle;font-size:1.1rem">auto_fix_high</span>
+            Auto Pipeline running...
+        </span>
+        <span id="pipeline-progress-result" style="color:rgba(255,255,255,0.7);font-size:0.8rem"></span>
+    </div>
+    <div style="background:rgba(0,0,0,0.3);border-radius:6px;height:8px;overflow:hidden">
+        <div id="pipeline-progress-bar" style="background:linear-gradient(90deg,#a855f7,#ec4899);height:100%;width:15%;animation:pulse 1.5s ease-in-out infinite"></div>
+    </div>
+</div>
+<script>
+(function(){
+    var palletId = {{ pallet.id }};
+    var bar = document.getElementById('pipeline-progress');
+    var result = document.getElementById('pipeline-progress-result');
+    var fill = document.getElementById('pipeline-progress-bar');
+    var wasRunning = false;
+
+    function pollPipeline() {
+        fetch('/pallet/' + palletId + '/pipeline-status')
+            .then(function(r){ return r.json(); })
+            .then(function(j){
+                if (j.status === 'running') {
+                    wasRunning = true;
+                    bar.style.display = 'block';
+                    result.textContent = '';
+                } else if (j.status === 'done') {
+                    if (wasRunning) { location.reload(); }
+                    else { bar.style.display = 'none'; }
+                } else if (j.status === 'error') {
+                    bar.style.display = 'block';
+                    result.textContent = 'ERROR: ' + (j.error || 'Unknown');
+                    fill.style.background = '#ef4444';
+                    fill.style.animation = 'none';
+                    fill.style.width = '100%';
+                } else {
+                    bar.style.display = 'none';
+                }
+            })
+            .catch(function(){});
+    }
+    pollPipeline();
+    setInterval(pollPipeline, 2000);
 })();
 </script>
 
@@ -5569,20 +5630,62 @@ def auto_process_products(pallet_id):
     return processed, drafts_created
 
 
+def _run_pallet_pipeline(pallet_id):
+    """Background worker for auto-pipeline — runs outside Flask request context."""
+    try:
+        processed, drafts = auto_process_products(pallet_id)
+        with _pipeline_lock:
+            _pipeline_jobs[pallet_id].update(
+                status='done', processed=processed, drafts=drafts
+            )
+    except Exception as e:
+        with _pipeline_lock:
+            _pipeline_jobs[pallet_id].update(status='error', error=str(e)[:300])
+
+
+@app.route('/pallet/<int:pallet_id>/pipeline-status')
+def pallet_pipeline_status(pallet_id):
+    """JSON status of the background auto-pipeline job for this pallet."""
+    with _pipeline_lock:
+        job = _pipeline_jobs.get(pallet_id)
+        if not job:
+            return jsonify({'status': 'idle'})
+        return jsonify({
+            'status': job.get('status', 'idle'),
+            'processed': job.get('processed', 0),
+            'drafts': job.get('drafts', 0),
+            'error': job.get('error', ''),
+        })
+
+
 @app.route('/pallet/<int:pallet_id>/auto-pipeline', methods=['POST'])
 def pallet_auto_pipeline(pallet_id):
-    """Run the full auto-pipeline on all products in a pallet."""
+    """Run the full auto-pipeline on all products in a pallet (background)."""
     pallet = query_db("SELECT * FROM pallets WHERE id = ?", (pallet_id,), one=True)
     if not pallet:
         flash('Pallet not found.', 'error')
         return redirect(url_for('pallets_list'))
 
-    processed, drafts = auto_process_products(pallet_id)
-    gemini_key = get_config('gemini_api_key', '')
+    with _pipeline_lock:
+        existing = _pipeline_jobs.get(pallet_id)
+        if existing and existing.get('status') == 'running':
+            flash('Pipeline is already running for this pallet — check back in a moment.', 'info')
+            return redirect(url_for('pallet_detail', pallet_id=pallet_id))
+        _pipeline_jobs[pallet_id] = {
+            'status': 'running',
+            'processed': 0,
+            'drafts': 0,
+            'error': '',
+            'started_at': time.time(),
+        }
 
-    msg = f'Auto-pipeline complete: {processed} products scraped, {drafts} drafts created.'
+    t = threading.Thread(target=_run_pallet_pipeline, args=(pallet_id,), daemon=True)
+    t.start()
+
+    gemini_key = get_config('gemini_api_key', '')
+    msg = 'Auto-pipeline started in the background. Refresh the page in a moment to see results.'
     if not gemini_key:
-        msg += ' (AI features skipped - set Gemini API key in Settings)'
+        msg += ' (AI features skipped — set Gemini API key in Settings)'
     flash(msg, 'success')
     return redirect(url_for('pallet_detail', pallet_id=pallet_id))
 
