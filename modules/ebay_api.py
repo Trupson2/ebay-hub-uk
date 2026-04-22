@@ -339,6 +339,30 @@ class EbayAPI:
         """Check if API credentials are set."""
         return bool(self.app_id and self.cert_id and self.dev_id and self.user_token)
 
+    def validate_credentials(self):
+        """
+        Test credentials against the live eBay API (GetUser call).
+        Returns (ok: bool, message: str).
+        """
+        if not self.is_configured():
+            return False, "Credentials not filled in — all four fields required."
+        xml_body = f"""<?xml version="1.0" encoding="utf-8"?>
+<GetUserRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+    <RequesterCredentials>
+        <eBayAuthToken>{self._escape_xml(self.user_token)}</eBayAuthToken>
+    </RequesterCredentials>
+    <ErrorLanguage>en_GB</ErrorLanguage>
+</GetUserRequest>"""
+        try:
+            success, root, error = self._make_trading_call('GetUser', xml_body)
+            if success:
+                user_id = root.findtext('.//UserID', '') if root is not None else ''
+                return True, f"Connected! eBay account: {user_id}"
+            else:
+                return False, f"eBay rejected credentials: {error}"
+        except Exception as e:
+            return False, f"Connection error: {e}"
+
     def _get_headers(self, call_name):
         """Build Trading API request headers."""
         return {

@@ -423,6 +423,7 @@ def pallet_add():
                                 return val
                 return ''
 
+            scrape_errors = 0
             for row in rows:
                 prod_name = get_col(row, 'name', 'title', 'product', 'nazwa')
                 # Supplier description — ground truth about what's physically in the
@@ -491,8 +492,9 @@ def pallet_add():
                                     (amazon_domain, pallet_id)
                                 )
                             scraped_cnt += 1
-                    except:
-                        pass
+                    except Exception as _se:
+                        scrape_errors += 1
+                        print(f"[Import] Scrape failed for {asin}: {_se}")
 
                 execute_db(
                     "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
@@ -502,6 +504,8 @@ def pallet_add():
                      supplier_desc)
                 )
                 imported += 1
+            if scrape_errors:
+                flash(f'{scrape_errors} product(s) could not be scraped from Amazon (blocked or unavailable). Images will be fetched by the background pipeline.', 'info')
         except Exception as e:
             flash(f'File import error: {e}', 'error')
 
@@ -1102,9 +1106,12 @@ def pallet_publish_all(pallet_id):
         image_urls = []
         try:
             custom_rels = json.loads(draft.get('custom_images') or '[]')
-            if isinstance(custom_rels, list) and _custom_img_base:
-                for rel in custom_rels:
-                    image_urls.append(f'{_custom_img_base}/static/{rel}')
+            if isinstance(custom_rels, list) and custom_rels:
+                if _custom_img_base:
+                    for rel in custom_rels:
+                        image_urls.append(f'{_custom_img_base}/static/{rel}')
+                else:
+                    errors.append(f"{draft['title'][:40]}: custom photos skipped — set Public URL in Settings")
         except (json.JSONDecodeError, TypeError):
             pass
         try:
@@ -3585,6 +3592,7 @@ def csv_import(pallet_id):
 
             count = 0
             scraped = 0
+            scrape_errors2 = 0
             from modules.scraper import scrape_amazon_product, get_amazon_image_url
 
             for row in rows:
@@ -3649,6 +3657,7 @@ def csv_import(pallet_id):
                             scraped += 1
                     except Exception as e:
                         print(f"[WARN] Scrape failed for {asin}: {e}")
+                        scrape_errors2 += 1
 
                 execute_db(
                     "INSERT INTO products (pallet_id, name, asin, ean, quantity, "
@@ -3663,6 +3672,8 @@ def csv_import(pallet_id):
             if scraped > 0:
                 where = pallet_domain or 'Amazon (auto-detected)'
                 msg += f' (scraped {scraped} from {where})'
+            if scrape_errors2:
+                flash(f'{scrape_errors2} product(s) could not be scraped from Amazon — images will be fetched by the background pipeline.', 'info')
 
             # Run auto-pipeline in background (avoids Cloudflare timeout)
             if count > 0:
@@ -4697,11 +4708,23 @@ TEMPLATE_SETTINGS_CONTENT = """
             <span class="material-symbols-outlined text-cyan" style="font-size:20px;">api</span>
             eBay API Credentials
         </div>
-        <p class="text-muted" style="font-size:0.85rem;margin:8px 0 16px 0;">
-            Get your API keys from
-            <span class="text-cyan">developer.ebay.com</span>.
-            These are required to publish listings and sync orders.
-        </p>
+
+        <!-- Step-by-step guide -->
+        <div style="background:rgba(6,182,212,0.08);border:1px solid rgba(6,182,212,0.25);border-radius:8px;padding:14px 16px;margin-bottom:16px;font-size:0.85rem;">
+            <div style="font-weight:600;color:#06b6d4;margin-bottom:10px;">
+                <span class="material-symbols-outlined" style="vertical-align:middle;font-size:1rem;">info</span>
+                How to get your eBay API keys (one-time setup, ~10 min)
+            </div>
+            <ol style="margin:0;padding-left:20px;line-height:2;color:rgba(255,255,255,0.85);">
+                <li>Go to <strong><a href="https://developer.ebay.com/my/keys" target="_blank" style="color:#06b6d4">developer.ebay.com/my/keys</a></strong> and sign in with your eBay account</li>
+                <li>Click <strong>"Create an Application Keyset"</strong>, choose a name (e.g. "EbayHub"), pick <strong>Production</strong></li>
+                <li>Copy <strong>App ID</strong>, <strong>Dev ID</strong> and <strong>Cert ID</strong> into the fields below</li>
+                <li>To get the <strong>User Token</strong>: go to <a href="https://developer.ebay.com/my/auth/?env=production&index=0" target="_blank" style="color:#06b6d4">developer.ebay.com/my/auth</a>, select your app, click <strong>"Get a User Token"</strong>, sign in, copy the token</li>
+                <li>Paste all four values below, click <strong>Save Settings</strong>, then click <strong>Test Connection</strong></li>
+            </ol>
+            <div style="margin-top:10px;color:rgba(255,255,255,0.5);font-size:0.8rem;">Token is valid for 18 months. You'll need to repeat step 4 when it expires.</div>
+        </div>
+
         <div class="form-row">
             <div class="form-group">
                 <label class="form-label">App ID (Client ID)</label>
@@ -4725,6 +4748,33 @@ TEMPLATE_SETTINGS_CONTENT = """
                 <input type="password" name="ebay_user_token" class="form-control"
                        value="{{ config.ebay_user_token }}" placeholder="OAuth user token">
             </div>
+        </div>
+
+        <!-- Test Connection -->
+        <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <button type="button" id="btn-test-ebay" onclick="testEbayConnection()"
+                    class="btn btn-sm" style="background:rgba(6,182,212,0.15);border:1px solid rgba(6,182,212,0.4);color:#06b6d4">
+                <span class="material-symbols-outlined">cable</span> Test Connection
+            </button>
+            <span id="ebay-test-result" style="font-size:0.85rem"></span>
+        </div>
+    </div>
+
+    <!-- Public URL (for custom images on eBay) -->
+    <div class="card mb-16">
+        <div class="card-title" style="display:flex;align-items:center;gap:8px;">
+            <span class="material-symbols-outlined text-lime" style="font-size:20px;">link</span>
+            App Public URL
+        </div>
+        <p class="text-muted" style="font-size:0.85rem;margin:8px 0 16px 0;">
+            Required for custom (uploaded) product photos to appear on eBay listings.
+            Set this to the public address of this app — e.g. <code>https://ebay.akceshub.com</code>.
+            If left empty, only Amazon images will be sent to eBay.
+        </p>
+        <div class="form-group">
+            <label class="form-label">Public URL</label>
+            <input type="text" name="public_base_url" class="form-control"
+                   value="{{ config.public_base_url or '' }}" placeholder="https://ebay.akceshub.com">
         </div>
     </div>
 
@@ -4844,6 +4894,32 @@ TEMPLATE_SETTINGS_CONTENT = """
         <span class="material-symbols-outlined">save</span> Save Settings
     </button>
 </form>
+<script>
+function testEbayConnection() {
+    var btn = document.getElementById('btn-test-ebay');
+    var result = document.getElementById('ebay-test-result');
+    btn.disabled = true;
+    result.style.color = 'rgba(255,255,255,0.5)';
+    result.textContent = 'Testing...';
+    fetch('/settings/test-ebay', {method: 'POST', headers: {'X-Requested-With': 'XMLHttpRequest'}})
+        .then(function(r){ return r.json(); })
+        .then(function(j){
+            btn.disabled = false;
+            if (j.ok) {
+                result.style.color = '#00ff88';
+                result.textContent = '✓ ' + j.message;
+            } else {
+                result.style.color = '#ef4444';
+                result.textContent = '✗ ' + j.message;
+            }
+        })
+        .catch(function(){
+            btn.disabled = false;
+            result.style.color = '#ef4444';
+            result.textContent = '✗ Network error — is the app running?';
+        });
+}
+</script>
 
 <!-- Backups -->
 <div class="card mb-16" style="margin-top:24px">
@@ -4932,7 +5008,7 @@ def settings():
             'telegram_bot_token', 'telegram_chat_id',
             'default_shipping', 'default_return_days',
             'default_shipping_pricing', 'seller_postcode',
-            'returns_policy',
+            'returns_policy', 'public_base_url',
         ]
         for key in keys:
             val = request.form.get(key, '')
@@ -4948,7 +5024,7 @@ def settings():
         'telegram_bot_token', 'telegram_chat_id',
         'default_shipping', 'default_return_days',
         'default_shipping_pricing', 'seller_postcode',
-        'returns_policy',
+        'returns_policy', 'public_base_url',
     ]
     for key in keys:
         config[key] = get_config(key, '')
@@ -4964,6 +5040,14 @@ def settings():
         backups=backups,
         shipping_groups=get_shipping_options_grouped(),
     )
+
+
+@app.route('/settings/test-ebay', methods=['POST'])
+def settings_test_ebay():
+    """Test eBay API credentials by calling GetUser."""
+    ebay = get_ebay_client(get_config)
+    ok, message = ebay.validate_credentials()
+    return jsonify({'ok': ok, 'message': message})
 
 
 @app.route('/settings/backup/create', methods=['POST'])
